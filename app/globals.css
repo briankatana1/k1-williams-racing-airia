@@ -1,0 +1,144 @@
+@import 'tailwindcss';
+@import 'tw-animate-css';
+
+@custom-variant dark (&:is(.dark *));
+
+@font-face {
+  font-family: 'F1Torque';
+  src: url('/fonts/F1Torque-Bold.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'F1Torque';
+  src: url('/fonts/F1Torque-Bold.woff2') format('woff2');
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'Formula1';
+  src: url('/fonts/Formula1-Regular.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'Formula1';
+  src: url('/fonts/Formula1-Bold.woff2') format('woff2');
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* Williams Racing 2026 Dark Theme */
+:root {
+  --background: #060A18;
+  --foreground: #E8ECF4;
+  --card: #0B1022;
+  --card-foreground: #E8ECF4;
+  --popover: #0B1022;
+  --popover-foreground: #E8ECF4;
+  --primary: #2563EB;
+  --primary-foreground: #FFFFFF;
+  --secondary: #111A35;
+  --secondary-foreground: #B0C4DE;
+  --muted: #111A35;
+  --muted-foreground: #7A8FB5;
+  --accent: #7C3AED;
+  --accent-foreground: #FFFFFF;
+  --destructive: #FF4444;
+  --destructive-foreground: #FF4444;
+  --border: #1C2B50;
+  --input: #1C2B50;
+  --ring: #2563EB;
+  --chart-1: #2563EB;
+  --chart-2: #7C3AED;
+  --chart-3: #FF6B35;
+  --chart-4: #FFD700;
+  --chart-5: #FF4444;
+  --radius: 0.75rem;
+  --sidebar: #0B1022;
+  --sidebar-foreground: #E8ECF4;
+  --sidebar-primary: #2563EB;
+  --sidebar-primary-foreground: #FFFFFF;
+  --sidebar-accent: #111A35;
+  --sidebar-accent-foreground: #E8ECF4;
+  --sidebar-border: #1C2B50;
+  --sidebar-ring: #2563EB;
+  --williams-blue: #2563EB;
+  --williams-purple: #7C3AED;
+  --williams-white: #FFFFFF;
+  --glow-blue: 0 0 20px rgba(37, 99, 235, 0.3);
+}
+
+@theme inline {
+  --font-sans: 'F1Torque', 'Formula1', 'Geist', 'Geist Fallback';
+  --font-mono: 'F1Torque', 'Formula1', 'Geist Mono', 'Geist Mono Fallback';
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-williams-blue: var(--williams-blue);
+  --color-williams-purple: var(--williams-purple);
+  --color-williams-white: var(--williams-white);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+}
+
+.scrollbar-hide::-webkit-scrollbar {
+  display: none;
+}
+
+@keyframes shimmer {
+  0% { background-position: 100% 0; }
+  100% { background-position: -50% 0; }
+}
+
+@keyframes streak {
+  0% { background-position: 200% 0; }
+  100% { background-position: -100% 0; }
+}
