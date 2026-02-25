@@ -32,6 +32,43 @@ interface HomeDashboardProps {
   onBack: () => void
 }
 
+// --- Shared Live Data (fetched once by parent) ---
+
+interface TyreStint {
+  stint_number: number
+  lap_start: number
+  lap_end: number
+  compound: string
+  tyre_age_at_start: number
+}
+
+interface LiveData {
+  laps: { lap_number: number; date_start: string }[]
+  intervals: any[]
+  stints: TyreStint[]
+  carData: any[]
+  location: any[]
+  currentLap: number
+}
+
+interface LiveDataProps {
+  driver: DriverId
+  driverName: string
+  driverNum: string
+  liveData: LiveData
+}
+
+const LIVE_DATA_DEFAULTS: LiveData = {
+  laps: [],
+  intervals: [],
+  stints: [],
+  carData: [],
+  location: [],
+  currentLap: getStartLap(30),
+}
+
+let _lastLiveDataFetchTime = 0
+
 // --- Live Tension Tracker ---
 
 type TensionTier = "MONITORING" | "BUILDING" | "DRS_ZONE" | "IMMINENT"
@@ -111,9 +148,6 @@ const TIER_COLORS: Record<TensionTier, { dot: string; label: string; text: strin
   DRS_ZONE: { dot: "bg-emerald-400", label: "text-emerald-400", text: "text-emerald-200" },
   IMMINENT: { dot: "bg-red-500", label: "text-red-400", text: "text-red-200" },
 }
-
-// Module-level caches
-let _lastTensionFetchTime = 0
 
 function classifyTier(text: string): TensionTier {
   const lower = text.toLowerCase()
@@ -406,7 +440,7 @@ function TensionHeader({ isLive, onToggle, loading, analyzeRef }: { isLive: bool
 }
 
 /* ---------- Main TensionTracker ---------- */
-function TensionTracker({ driver }: { driver: DriverId }) {
+function TensionTracker({ driver, driverName, driverNum, liveData }: LiveDataProps) {
   const [state, dispatch] = useReducer(tensionReducer, {
     bullets: [],
     gapHistory: [],
@@ -418,65 +452,22 @@ function TensionTracker({ driver }: { driver: DriverId }) {
   const [isLive, setIsLive] = useState(true)
   const prevDriverRef = useRef(driver)
 
-  const driverName = driver === "albon" ? "Albon" : "Sainz"
-  const driverNum = driver === "albon" ? "23" : "55"
-
   // Reset on driver change
   useEffect(() => {
     if (prevDriverRef.current !== driver) {
       prevDriverRef.current = driver
       dispatch({ type: "RESET" })
-      _lastTensionFetchTime = 0
     }
   }, [driver])
 
-  // Fetch intervals/laps from OpenF1 every 60s (no AI call — that's button-only)
+  // Process intervals from parent liveData into gap history + overtakes
   useEffect(() => {
-    let stale = false
-    let firstFetch = true
-
-    async function fetchIntervals() {
-      if (document.hidden) return
-      if (!firstFetch) {
-        const sinceLast = Date.now() - _lastTensionFetchTime
-        if (_lastTensionFetchTime > 0 && sinceLast < 60_000) return
-      }
-      firstFetch = false
-      _lastTensionFetchTime = Date.now()
-      const sessionKey = getSessionKey()
-      const simTime = simNow().toISOString()
-
-      try {
-        const [intData, lapData] = await Promise.all([
-          cachedFetch<any[]>(`https://api.openf1.org/v1/intervals?session_key=${sessionKey}&driver_number=${driverNum}&date%3C=${encodeURIComponent(simTime)}`).catch(() => []),
-          cachedFetch<any[]>(`https://api.openf1.org/v1/laps?session_key=${sessionKey}&driver_number=${driverNum}`).catch(() => []),
-        ])
-
-        if (!stale && Array.isArray(intData) && intData.length > 0) {
-          const recent = intData.slice(-12)
-          const { gaps, overtakes } = buildFromIntervals(recent, lapData, driverNum)
-          dispatch({ type: "INTERVALS_UPDATE", gaps, overtakes })
-        }
-      } catch {
-        // Non-critical
-      }
+    if (liveData.intervals.length > 0) {
+      const recent = liveData.intervals.slice(-12)
+      const { gaps, overtakes } = buildFromIntervals(recent, liveData.laps, driverNum)
+      dispatch({ type: "INTERVALS_UPDATE", gaps, overtakes })
     }
-
-    fetchIntervals()
-
-    const interval = isLive ? setInterval(fetchIntervals, 60_000) : null
-
-    function onVisChange() {
-      if (!document.hidden && isLive && !stale) fetchIntervals()
-    }
-    document.addEventListener("visibilitychange", onVisChange)
-
-    return () => {
-      stale = true
-      if (interval) clearInterval(interval)
-      document.removeEventListener("visibilitychange", onVisChange)
-    }
-  }, [isLive, driver, driverNum])
+  }, [liveData.intervals, liveData.laps, driverNum])
 
   // AI commentary — triggered manually via Analyze button
   const analyzeRef = useRef<() => void>(() => {})
@@ -485,7 +476,7 @@ function TensionTracker({ driver }: { driver: DriverId }) {
 
     dispatch({ type: "FETCH_START" })
 
-    const currentLap = getStartLap(30)
+    const currentLap = liveData.currentLap
     const totalLaps = 58
     const lapsRemaining = totalLaps - currentLap
 
@@ -597,10 +588,7 @@ interface TelemetryState {
   error: string | null
 }
 
-// Module-level caches
-const _telemetryFetchCache = new Map<string, Promise<any>>()
 let _circuitLayoutCache: Promise<CircuitLayout | null> | null = null
-let _lastTelemetryPollTime = 0
 
 function fetchCircuitLayout(): Promise<CircuitLayout | null> {
   if (!_circuitLayoutCache) {
@@ -753,7 +741,7 @@ function MiniTrackMap({ layout, activeCorner, driverPos }: { layout: CircuitLayo
   )
 }
 
-function TelemetryStoryteller({ driver }: { driver: DriverId }) {
+function TelemetryStoryteller({ driver, driverName, driverNum, liveData }: LiveDataProps) {
   const [expanded, setExpanded] = useState(false)
   const [state, setState] = useState<TelemetryState>({
     reading: null,
@@ -768,16 +756,11 @@ function TelemetryStoryteller({ driver }: { driver: DriverId }) {
   const [circuit, setCircuit] = useState<CircuitLayout | null>(null)
   const prevDriverRef = useRef(driver)
 
-  const driverName = driver === "albon" ? "Albon" : "Sainz"
-  const driverNum = driver === "albon" ? "23" : "55"
-
   // Reset on driver change
   useEffect(() => {
     if (prevDriverRef.current !== driver) {
       prevDriverRef.current = driver
       setState({ reading: null, gForce: null, driverPos: null, narrative: "", detail: "", activeCorner: null, loading: false, error: null })
-      _telemetryFetchCache.clear()
-      _lastTelemetryPollTime = 0
       setExpanded(false)
     }
   }, [driver])
@@ -791,91 +774,46 @@ function TelemetryStoryteller({ driver }: { driver: DriverId }) {
     return () => { stale = true }
   }, [])
 
-  // Poll car_data + location every 60s, only when page is visible, with cooldown
+  // Derive reading / gForce / driverPos from parent liveData
   useEffect(() => {
-    let stale = false
-    let timer: ReturnType<typeof setTimeout> | null = null
-    let firstFetch = true
+    const carData = liveData.carData
+    const locData = liveData.location
 
-    async function pollData() {
-      if (document.hidden) return
-      if (!firstFetch) {
-        const sinceLast = Date.now() - _lastTelemetryPollTime
-        if (_lastTelemetryPollTime > 0 && sinceLast < 60_000) return
+    let reading: CarDataReading | null = null
+    let gForce: number | null = null
+    let driverPos: DriverPosition | null = null
+
+    if (Array.isArray(carData) && carData.length > 0) {
+      const latest = carData[carData.length - 1]
+      reading = {
+        throttle: latest.throttle ?? 0,
+        brake: latest.brake ?? 0,
+        speed: latest.speed ?? 0,
+        rpm: latest.rpm ?? 0,
+        n_gear: latest.n_gear ?? 0,
+        drs: latest.drs ?? 0,
       }
-      firstFetch = false
-      _lastTelemetryPollTime = Date.now()
-
-      const sessionKey = getSessionKey()
-      const simTime = simNow()
-      const simIso = simTime.toISOString()
-      const tenSecAgo = new Date(simTime.getTime() - 10_000).toISOString()
-
-      let reading: CarDataReading | null = null
-      let gForce: number | null = null
-      let driverPos: DriverPosition | null = null
-      try {
-        const carUrl = `https://api.openf1.org/v1/car_data?session_key=${sessionKey}&driver_number=${driverNum}&date%3C=${encodeURIComponent(simIso)}&date%3E=${encodeURIComponent(tenSecAgo)}`
-        const locUrl = `https://api.openf1.org/v1/location?session_key=${sessionKey}&driver_number=${driverNum}&date%3C=${encodeURIComponent(simIso)}&date%3E=${encodeURIComponent(tenSecAgo)}`
-        const [carData, locData] = await Promise.all([
-          cachedFetch<any[]>(carUrl).catch(() => []),
-          cachedFetch<any[]>(locUrl).catch(() => []),
-        ])
-        if (Array.isArray(carData) && carData.length > 0) {
-          const latest = carData[carData.length - 1]
-          reading = {
-            throttle: latest.throttle ?? 0,
-            brake: latest.brake ?? 0,
-            speed: latest.speed ?? 0,
-            rpm: latest.rpm ?? 0,
-            n_gear: latest.n_gear ?? 0,
-            drs: latest.drs ?? 0,
-          }
-          if (carData.length >= 2) {
-            const prev = carData[carData.length - 2]
-            const dtMs = new Date(latest.date).getTime() - new Date(prev.date).getTime()
-            if (dtMs > 0) {
-              const dvMs2 = ((latest.speed ?? 0) - (prev.speed ?? 0)) / 3.6
-              gForce = Math.round(Math.abs(dvMs2 / (dtMs / 1000) / 9.81) * 10) / 10
-            }
-          }
+      if (carData.length >= 2) {
+        const prev = carData[carData.length - 2]
+        const dtMs = new Date(latest.date).getTime() - new Date(prev.date).getTime()
+        if (dtMs > 0) {
+          const dvMs2 = ((latest.speed ?? 0) - (prev.speed ?? 0)) / 3.6
+          gForce = Math.round(Math.abs(dvMs2 / (dtMs / 1000) / 9.81) * 10) / 10
         }
-        if (Array.isArray(locData) && locData.length > 0) {
-          const latest = locData[locData.length - 1]
-          if (latest.x != null && latest.y != null) {
-            driverPos = { x: latest.x, y: latest.y }
-          }
-        }
-      } catch {
-        // Non-critical
       }
-
-      if (!stale && reading) {
-        const activeCorner = driverPos && circuit ? findNearestCorner(driverPos, circuit.corners ?? []) : null
-        setState((prev) => ({ ...prev, reading, gForce, driverPos, activeCorner: activeCorner ?? prev.activeCorner }))
+    }
+    if (Array.isArray(locData) && locData.length > 0) {
+      const latest = locData[locData.length - 1]
+      if (latest.x != null && latest.y != null) {
+        driverPos = { x: latest.x, y: latest.y }
       }
     }
 
-    function schedule() {
-      timer = setTimeout(async () => {
-        await pollData()
-        if (!stale) schedule()
-      }, 60_000)
+    if (reading) {
+      const activeCorner = driverPos && circuit ? findNearestCorner(driverPos, circuit.corners ?? []) : null
+      setState((prev) => ({ ...prev, reading, gForce, driverPos, activeCorner: activeCorner ?? prev.activeCorner }))
     }
-
-    pollData().then(() => { if (!stale) schedule() })
-
-    function onVisChange() {
-      if (!document.hidden && !stale) pollData()
-    }
-    document.addEventListener("visibilitychange", onVisChange)
-
-    return () => {
-      stale = true
-      if (timer) clearTimeout(timer)
-      document.removeEventListener("visibilitychange", onVisChange)
-    }
-  }, [driver, driverNum])
+  }, [liveData.carData, liveData.location, circuit])
 
   // AI narrative — triggered manually via button
   const analyzeRef = useRef<() => void>(() => {})
@@ -897,23 +835,13 @@ Do NOT call any tools. Write exactly 2 paragraphs:
 Paragraph 1: What the driver is doing right now at this point on the Yas Marina circuit. Reference the actual Turn number provided above.
 Paragraph 2: Deeper technical detail about the car behavior and what this means for performance.`
 
-    const cacheKey = `${driver}-${Date.now()}`
-    _telemetryFetchCache.set(
-      cacheKey,
-      fetch("/api/airia", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ userInput: prompt, pipeline: "telemetry" }),
-      })
-        .then((res) => res.json())
-        .catch((err) => {
-          _telemetryFetchCache.delete(cacheKey)
-          throw err
-        }),
-    )
-
-    _telemetryFetchCache.get(cacheKey)!
-      .then((data) => {
+    fetch("/api/airia", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ userInput: prompt, pipeline: "telemetry" }),
+    })
+      .then((res) => res.json())
+      .then((data: any) => {
         if (data.error) {
           setState((prev) => ({ ...prev, loading: false, error: data.error }))
           return
@@ -1079,117 +1007,29 @@ const COMPOUND_COLORS: Record<string, string> = {
   WET: "#2563EB",
 }
 
-let _lastTyreFetchTime = 0
-
-interface TyreStint {
-  stint_number: number
-  lap_start: number
-  lap_end: number
-  compound: string
-  tyre_age_at_start: number
-}
-
 interface TyreState {
-  stints: TyreStint[]
-  laps: { lap_number: number; date_start: string }[]
   prediction: string
   loading: boolean
   error: string | null
 }
 
-function TyrePredictor({ driver }: { driver: DriverId }) {
-  const driverName = driver === "albon" ? "Albon" : "Sainz"
-  const driverNum = driver === "albon" ? "23" : "55"
-
-  const [state, setState] = useState<TyreState>({ stints: [], laps: [], prediction: "", loading: false, error: null })
+function TyrePredictor({ driver, driverName, driverNum, liveData }: LiveDataProps) {
+  const [state, setState] = useState<TyreState>({ prediction: "", loading: false, error: null })
   const prevDriverRef = useRef(driver)
 
   // Reset on driver change
   useEffect(() => {
     if (prevDriverRef.current !== driver) {
       prevDriverRef.current = driver
-      setState({ stints: [], laps: [], prediction: "", loading: false, error: null })
-      _lastTyreFetchTime = 0
+      setState({ prediction: "", loading: false, error: null })
     }
   }, [driver])
 
-  // Fetch stints from OpenF1
-  useEffect(() => {
-    let stale = false
-    let firstFetch = true
-
-    async function fetchStints() {
-      if (document.hidden) return
-      if (!firstFetch) {
-        const sinceLast = Date.now() - _lastTyreFetchTime
-        if (_lastTyreFetchTime > 0 && sinceLast < 60_000) return
-      }
-      firstFetch = false
-      _lastTyreFetchTime = Date.now()
-
-      const sessionKey = getSessionKey()
-      try {
-        const [stintData, lapData] = await Promise.all([
-          cachedFetch<any[]>(`https://api.openf1.org/v1/stints?session_key=${sessionKey}&driver_number=${driverNum}`).catch(() => []),
-          cachedFetch<any[]>(`https://api.openf1.org/v1/laps?session_key=${sessionKey}&driver_number=${driverNum}`).catch(() => []),
-        ])
-        if (!stale) {
-          setState((prev) => ({
-            ...prev,
-            stints: Array.isArray(stintData) ? stintData.map((s: any) => ({
-              stint_number: s.stint_number,
-              lap_start: s.lap_start,
-              lap_end: s.lap_end,
-              compound: (s.compound ?? "UNKNOWN").toUpperCase(),
-              tyre_age_at_start: s.tyre_age_at_start ?? 0,
-            })) : prev.stints,
-            laps: Array.isArray(lapData) ? lapData.map((l: any) => ({
-              lap_number: l.lap_number,
-              date_start: l.date_start,
-            })) : prev.laps,
-          }))
-        }
-      } catch {
-        // Non-critical — keep existing data
-      }
-    }
-
-    let timer: ReturnType<typeof setTimeout>
-    function schedule() {
-      timer = setTimeout(async () => {
-        await fetchStints()
-        if (!stale) schedule()
-      }, 60_000)
-    }
-
-    fetchStints().then(() => { if (!stale) schedule() })
-
-    function onVisChange() {
-      if (!document.hidden && !stale) fetchStints()
-    }
-    document.addEventListener("visibilitychange", onVisChange)
-
-    return () => {
-      stale = true
-      if (timer) clearTimeout(timer)
-      document.removeEventListener("visibilitychange", onVisChange)
-    }
-  }, [driver, driverNum])
-
-  // Derive rolling current lap from sim clock + laps endpoint
-  const currentLap = (() => {
-    const t = simNow().getTime()
-    let best = getStartLap(30)
-    for (const l of state.laps) {
-      if (new Date(l.date_start).getTime() <= t) best = l.lap_number
-      else break
-    }
-    return best
-  })()
+  const currentLap = liveData.currentLap
   const totalLaps = 58
 
-  const classifiedStints = state.stints.map((s) => {
-    const isActive = s.lap_end >= currentLap || s.lap_end === 0 || s.stint_number === state.stints.length
+  const classifiedStints = liveData.stints.map((s) => {
+    const isActive = s.lap_end >= currentLap || s.lap_end === 0 || s.stint_number === liveData.stints.length
     const status: "active" | "completed" = (isActive && s.lap_start <= currentLap) ? "active" : "completed"
     const tyreAge = status === "active" ? currentLap - s.lap_start + s.tyre_age_at_start : undefined
     return { ...s, status, tyreAge }
@@ -1207,11 +1047,11 @@ function TyrePredictor({ driver }: { driver: DriverId }) {
   // Predict button — same pattern as telemetry Analyze
   const predictRef = useRef<() => void>(() => {})
   predictRef.current = () => {
-    if (state.loading || state.stints.length === 0) return
+    if (state.loading || liveData.stints.length === 0) return
 
     setState((prev) => ({ ...prev, loading: true, error: null }))
 
-    const stintSummary = state.stints
+    const stintSummary = liveData.stints
       .map((s) => `Stint ${s.stint_number}: ${s.compound}, laps ${s.lap_start}-${s.lap_end || "?"}, tyre age at start: ${s.tyre_age_at_start}`)
       .join("\n")
 
@@ -1240,7 +1080,7 @@ Do NOT call any tools. Write 2-3 short paragraphs.`
       body: JSON.stringify({ userInput: prompt, pipeline: "tyre" }),
     })
       .then((res) => res.json())
-      .then((data) => {
+      .then((data: any) => {
         if (data.error) {
           setState((prev) => ({ ...prev, loading: false, error: data.error }))
           return
@@ -1272,7 +1112,7 @@ Do NOT call any tools. Write 2-3 short paragraphs.`
           </div>
         </div>
         <div className="px-3 py-1 rounded-full bg-secondary border border-border">
-          <span className="text-xs font-mono text-muted-foreground">{state.stints.length} stint{state.stints.length !== 1 ? "s" : ""}</span>
+          <span className="text-xs font-mono text-muted-foreground">{liveData.stints.length} stint{liveData.stints.length !== 1 ? "s" : ""}</span>
         </div>
       </div>
 
@@ -1332,7 +1172,7 @@ Do NOT call any tools. Write 2-3 short paragraphs.`
             <span className="text-xs font-mono text-[#2563EB] uppercase tracking-wider">AI Prediction</span>
             <button
               onClick={() => predictRef.current()}
-              disabled={state.stints.length === 0 || state.loading}
+              disabled={liveData.stints.length === 0 || state.loading}
               className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#2563EB] text-white text-xs font-medium disabled:opacity-40 disabled:cursor-not-allowed hover:bg-[#2563EB]/90 transition-colors"
             >
               {state.loading ? <Loader2 className="w-3 h-3 animate-spin" /> : <CircleDot className="w-3 h-3" />}
@@ -1366,6 +1206,10 @@ export function HomeDashboard({ onBack }: HomeDashboardProps) {
   const [driver, setDriver] = useState<DriverId>("albon")
   const [activeTab, setActiveTab] = useState<TabId>("tension")
   const [sessionLabel, setSessionLabel] = useState("Session")
+  const [liveData, setLiveData] = useState<LiveData>(LIVE_DATA_DEFAULTS)
+
+  const driverName = driver === "albon" ? "Albon" : "Sainz"
+  const driverNum = driver === "albon" ? "23" : "55"
 
   useEffect(() => {
     cachedFetch<any[]>(getSessionsUrl())
@@ -1373,11 +1217,97 @@ export function HomeDashboard({ onBack }: HomeDashboardProps) {
       .catch(() => {})
   }, [])
 
+  // Centralised live data polling — one 60s loop for all OpenF1 endpoints
+  useEffect(() => {
+    let stale = false
+    let firstFetch = true
+
+    async function poll() {
+      if (document.hidden) return
+      if (!firstFetch) {
+        const sinceLast = Date.now() - _lastLiveDataFetchTime
+        if (_lastLiveDataFetchTime > 0 && sinceLast < 60_000) return
+      }
+      firstFetch = false
+      _lastLiveDataFetchTime = Date.now()
+
+      const sk = getSessionKey()
+      const simTime = simNow()
+      const simIso = simTime.toISOString()
+      const tenSecAgo = new Date(simTime.getTime() - 10_000).toISOString()
+
+      try {
+        const [laps, intervals, stints, carData, location] = await Promise.all([
+          cachedFetch<any[]>(`https://api.openf1.org/v1/laps?session_key=${sk}&driver_number=${driverNum}`).catch(() => []),
+          cachedFetch<any[]>(`https://api.openf1.org/v1/intervals?session_key=${sk}&driver_number=${driverNum}&date%3C=${encodeURIComponent(simIso)}`).catch(() => []),
+          cachedFetch<any[]>(`https://api.openf1.org/v1/stints?session_key=${sk}&driver_number=${driverNum}`).catch(() => []),
+          cachedFetch<any[]>(`https://api.openf1.org/v1/car_data?session_key=${sk}&driver_number=${driverNum}&date%3C=${encodeURIComponent(simIso)}&date%3E=${encodeURIComponent(tenSecAgo)}`).catch(() => []),
+          cachedFetch<any[]>(`https://api.openf1.org/v1/location?session_key=${sk}&driver_number=${driverNum}&date%3C=${encodeURIComponent(simIso)}&date%3E=${encodeURIComponent(tenSecAgo)}`).catch(() => []),
+        ])
+
+        if (stale) return
+
+        // Derive currentLap from laps + simNow (dynamic approach)
+        const t = simTime.getTime()
+        let currentLap = getStartLap(30)
+        const lapArr = Array.isArray(laps) ? laps : []
+        for (const l of lapArr) {
+          if (new Date(l.date_start).getTime() <= t) currentLap = l.lap_number
+          else break
+        }
+
+        // Normalise stints
+        const normStints: TyreStint[] = Array.isArray(stints)
+          ? stints.map((s: any) => ({
+              stint_number: s.stint_number,
+              lap_start: s.lap_start,
+              lap_end: s.lap_end,
+              compound: (s.compound ?? "UNKNOWN").toUpperCase(),
+              tyre_age_at_start: s.tyre_age_at_start ?? 0,
+            }))
+          : []
+
+        setLiveData({
+          laps: Array.isArray(laps) ? laps.map((l: any) => ({ lap_number: l.lap_number, date_start: l.date_start })) : [],
+          intervals: Array.isArray(intervals) ? intervals : [],
+          stints: normStints,
+          carData: Array.isArray(carData) ? carData : [],
+          location: Array.isArray(location) ? location : [],
+          currentLap,
+        })
+      } catch {
+        // Non-critical — keep existing data
+      }
+    }
+
+    poll()
+    const timer = setInterval(poll, 60_000)
+
+    function onVisChange() {
+      if (!document.hidden && !stale) poll()
+    }
+    document.addEventListener("visibilitychange", onVisChange)
+
+    return () => {
+      stale = true
+      clearInterval(timer)
+      document.removeEventListener("visibilitychange", onVisChange)
+    }
+  }, [driver, driverNum])
+
+  // Reset live data + cooldown when driver changes
+  useEffect(() => {
+    setLiveData(LIVE_DATA_DEFAULTS)
+    _lastLiveDataFetchTime = 0
+  }, [driver])
+
   const tabs: { id: TabId; label: string; icon: typeof TrendingUp }[] = [
     { id: "tension", label: "Tension", icon: TrendingUp },
     { id: "telemetry", label: "Telemetry", icon: Activity },
     { id: "tyre", label: "Tyres", icon: CircleDot },
   ]
+
+  const liveDataProps = { driver, driverName, driverNum, liveData }
 
   return (
     <div className="h-full min-h-dvh flex flex-col bg-background">
@@ -1431,9 +1361,9 @@ export function HomeDashboard({ onBack }: HomeDashboardProps) {
 
       {/* Content — keep all tabs mounted to preserve state across switches */}
       <main className="flex-1 px-5 py-4 pb-8">
-        <div className={activeTab === "tension" ? "" : "hidden"}><TensionTracker driver={driver} /></div>
-        <div className={activeTab === "telemetry" ? "" : "hidden"}><TelemetryStoryteller driver={driver} /></div>
-        <div className={activeTab === "tyre" ? "" : "hidden"}><TyrePredictor driver={driver} /></div>
+        <div className={activeTab === "tension" ? "" : "hidden"}><TensionTracker {...liveDataProps} /></div>
+        <div className={activeTab === "telemetry" ? "" : "hidden"}><TelemetryStoryteller {...liveDataProps} /></div>
+        <div className={activeTab === "tyre" ? "" : "hidden"}><TyrePredictor {...liveDataProps} /></div>
       </main>
     </div>
   )
