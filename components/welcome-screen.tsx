@@ -69,7 +69,7 @@ export function WelcomeScreen({ onReady }: WelcomeScreenProps) {
         {/* Title */}
         <div className={`text-center transition-all duration-1000 delay-700 ${phase === "loading" ? "opacity-0 translate-y-4" : "opacity-100 translate-y-0"}`}>
           <h1 className="text-3xl font-bold tracking-tight text-foreground text-balance">
-            Williams Experience
+            Williams AI Experience
           </h1>
           <p className="mt-3 text-muted-foreground text-sm leading-relaxed">
             Be a part of the crew, experience every pit stop, overtake, and strategy call.
@@ -100,6 +100,7 @@ export function WelcomeScreen({ onReady }: WelcomeScreenProps) {
           <div className="absolute inset-0 opacity-0 group-hover:opacity-100 transition-opacity duration-300 bg-white/10" />
           {/* Content */}
           <span className="relative z-10 flex items-center justify-center gap-3">
+            <ChevronRight className="w-5 h-5 opacity-0" aria-hidden />
             <span>Ready for {sessionLabel}</span>
             <ChevronRight className="w-5 h-5 transition-transform group-hover:translate-x-1" />
           </span>
@@ -107,7 +108,7 @@ export function WelcomeScreen({ onReady }: WelcomeScreenProps) {
 
         {/* Powered by line */}
         <p className={`text-xs text-muted-foreground/50 font-mono uppercase tracking-widest transition-all duration-1000 delay-[1100ms] ${phase === "loading" ? "opacity-0" : "opacity-100"}`}>
-          Powered by Katana1 on Airia.AI
+          Powered by Katana1 on Airia
         </p>
       </div>
     </div>

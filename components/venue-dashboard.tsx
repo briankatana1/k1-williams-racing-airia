@@ -48,28 +48,57 @@ function doFetch(driver: DriverId) {
 function PitStrategyCard({ driver }: { driver: DriverId }) {
   const [pitData, setPitData] = useState<PitData | null>(null)
   const [strategy, setStrategy] = useState<string | null>(null)
-  const [loading, setLoading] = useState(true)
+  const [phase, setPhase] = useState<"loading" | "leaving" | "done">("loading")
+  const [pitTime, setPitTime] = useState("0.00")
+  const pitTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   const driverName = driver === "albon" ? "Albon" : "Sainz"
   const driverNum = driver === "albon" ? 23 : 55
 
+  // Animate pit time counting up from 0 to actual duration
+  const animatePitTime = (target: number) => {
+    if (pitTimerRef.current) clearInterval(pitTimerRef.current)
+    const duration = 800
+    const start = Date.now()
+    setPitTime("0.00")
+    pitTimerRef.current = setInterval(() => {
+      const progress = Math.min((Date.now() - start) / duration, 1)
+      const eased = 1 - Math.pow(1 - progress, 3)
+      setPitTime((eased * target).toFixed(2))
+      if (progress >= 1) clearInterval(pitTimerRef.current!)
+    }, 30)
+  }
+
   useEffect(() => {
     let stale = false
+    const startTime = Date.now()
+    const MIN_PIT_MS = 1500
 
-    setLoading(true)
+    setPhase("loading")
     setPitData(null)
     setStrategy(null)
+    setPitTime("0.00")
 
     // Reuse in-flight promise if one already exists for this driver
     if (!_fetchCache.has(driver)) {
       _fetchCache.set(driver, doFetch(driver))
     }
 
-    _fetchCache.get(driver)!.then(([pitResult, airiaResult]) => {
+    _fetchCache.get(driver)!.then(async ([pitResult, airiaResult]) => {
+      if (stale) return
+
+      // Ensure pit stop animation plays for at least MIN_PIT_MS
+      const elapsed = Date.now() - startTime
+      if (elapsed < MIN_PIT_MS) {
+        await new Promise(r => setTimeout(r, MIN_PIT_MS - elapsed))
+      }
       if (stale) return
 
       if (pitResult.status === "fulfilled") {
         setPitData(pitResult.value)
+        // Animate pit time count-up to actual duration
+        const dur = pitResult.value.pitDuration
+        if (dur != null) animatePitTime(dur)
       }
 
       if (airiaResult.status === "fulfilled" && !airiaResult.value.error) {
@@ -80,10 +109,20 @@ function PitStrategyCard({ driver }: { driver: DriverId }) {
         setStrategy("AI analysis is temporarily unavailable.")
       }
 
-      setLoading(false)
+      // Let the count-up animation finish (800ms), then car drives out
+      await new Promise(r => setTimeout(r, 850))
+      if (stale) return
+
+      setPhase("leaving")
+      setTimeout(() => {
+        if (!stale) setPhase("done")
+      }, 900)
     })
 
-    return () => { stale = true }
+    return () => {
+      stale = true
+      if (pitTimerRef.current) clearInterval(pitTimerRef.current)
+    }
   }, [driver])
 
   const tyreColor = pitData ? (TYRE_COLORS[pitData.compound] ?? "#888888") : "#888888"
@@ -109,10 +148,104 @@ function PitStrategyCard({ driver }: { driver: DriverId }) {
 
       {/* Pit Data Grid */}
       <div className="p-5 flex-1 overflow-y-auto scrollbar-hide" style={{ scrollbarWidth: "none", WebkitOverflowScrolling: "touch" }}>
-        {loading ? (
-          <div className="flex flex-col items-center justify-center py-8 gap-3">
-            <div className="w-8 h-8 border-2 border-[#2563EB]/30 border-t-[#2563EB] rounded-full animate-spin" />
-            <span className="text-sm text-muted-foreground font-mono">Analyzing #{driverNum} {driverName} strategy...</span>
+        {phase !== "done" ? (
+          <div className="flex flex-col items-center justify-center py-8 gap-4">
+            {/* Pit stop animation */}
+            <div className="relative w-48 h-24 overflow-hidden">
+              {/* Pit lane surface */}
+              <div className="absolute bottom-2 left-0 right-0 h-[2px] bg-border" />
+              <div className="absolute bottom-1 left-0 right-0 flex justify-between px-4">
+                {[...Array(6)].map((_, i) => (
+                  <div key={i} className="w-4 h-[1px] bg-muted-foreground/30" />
+                ))}
+              </div>
+
+              {/* Car */}
+              <div
+                key={phase}
+                className={`absolute bottom-4 ${
+                  phase === "loading"
+                    ? "animate-[pitCarIn_1.2s_ease-out_forwards]"
+                    : "animate-[pitCarOut_0.8s_ease-in_forwards]"
+                }`}
+                style={{ left: phase === "leaving" ? "62px" : "-60px" }}
+              >
+                <div className="relative">
+                  <div className="absolute -left-1 top-0 w-[3px] h-3 bg-[#2563EB] rounded-sm" />
+                  <div className="w-14 h-3 bg-gradient-to-r from-[#2563EB] to-[#2563EB]/80 rounded-r-full rounded-l-sm" />
+                  <div className="absolute right-[-6px] top-[3px] w-3 h-[6px] bg-[#2563EB]/60 rounded-r-full" />
+                  <div className="absolute left-4 -top-1 w-3 h-2 bg-[#060A18] rounded-t-md" />
+                  <div className="absolute -right-1 -bottom-1.5 w-3 h-3 rounded-full bg-[#1a1a1a] border border-[#333] animate-[wheelSpin_0.3s_linear_infinite] flex items-center justify-center">
+                    <div className="w-1 h-1 rounded-full bg-[#333]" />
+                  </div>
+                  <div className="absolute left-1 -bottom-1.5 w-3 h-3 rounded-full bg-[#1a1a1a] border border-[#333] animate-[wheelSpin_0.3s_linear_infinite] flex items-center justify-center">
+                    <div className="w-1 h-1 rounded-full bg-[#333]" />
+                  </div>
+                </div>
+              </div>
+
+              {/* Sparks + crew + tyre — only during loading phase */}
+              {phase === "loading" && (
+                <>
+                  <div className="absolute bottom-6 left-[52%] animate-[fadeInOut_0.6s_ease-in-out_1.4s_infinite]">
+                    <div className="flex gap-0.5">
+                      <div className="w-1 h-1 rounded-full bg-amber-400" />
+                      <div className="w-0.5 h-0.5 rounded-full bg-amber-300 mt-0.5" />
+                      <div className="w-1 h-1 rounded-full bg-amber-400" />
+                    </div>
+                  </div>
+                  <div className="absolute bottom-6 left-[30%] animate-[fadeInOut_0.6s_ease-in-out_1.7s_infinite]">
+                    <div className="flex gap-0.5">
+                      <div className="w-1 h-1 rounded-full bg-amber-400" />
+                      <div className="w-0.5 h-0.5 rounded-full bg-amber-300 mt-0.5" />
+                      <div className="w-1 h-1 rounded-full bg-amber-400" />
+                    </div>
+                  </div>
+                  <div className="absolute bottom-3 left-[26%] animate-[crewAppear_0.3s_ease-out_1.2s_both]">
+                    <div className="w-2 h-5 bg-muted-foreground/40 rounded-t-full" />
+                  </div>
+                  <div className="absolute bottom-3 left-[48%] animate-[crewAppear_0.3s_ease-out_1.3s_both]">
+                    <div className="w-2 h-5 bg-muted-foreground/40 rounded-t-full" />
+                  </div>
+                  <div className="absolute bottom-3 left-[56%] animate-[crewAppear_0.3s_ease-out_1.35s_both]">
+                    <div className="w-2 h-4 bg-muted-foreground/30 rounded-t-full" />
+                  </div>
+                  <div className="absolute bottom-8 left-[60%] animate-[tyreOff_0.8s_ease-out_1.8s_both]">
+                    <div className="w-4 h-4 rounded-full bg-[#1a1a1a] border-2 border-[#EF4444] flex items-center justify-center">
+                      <div className="w-1.5 h-1.5 rounded-full bg-[#111]" />
+                    </div>
+                  </div>
+                </>
+              )}
+
+              {/* Green light flash when leaving */}
+              {phase === "leaving" && (
+                <div className="absolute top-1 right-2 flex gap-1 animate-[fadeInOut_0.4s_ease-in-out_forwards]">
+                  <div className="w-2 h-2 rounded-full bg-emerald-400 shadow-[0_0_6px_rgba(34,197,94,0.8)]" />
+                  <div className="w-2 h-2 rounded-full bg-emerald-400 shadow-[0_0_6px_rgba(34,197,94,0.8)]" />
+                  <div className="w-2 h-2 rounded-full bg-emerald-400 shadow-[0_0_6px_rgba(34,197,94,0.8)]" />
+                </div>
+              )}
+            </div>
+
+            {/* Pit timer */}
+            <div className="font-mono tabular-nums text-center">
+              <span className="text-2xl font-bold text-foreground">{pitTime}</span>
+              <span className="text-xs text-muted-foreground ml-1">s</span>
+            </div>
+
+            {/* Text below */}
+            <div className="flex items-center gap-2">
+              <span className="text-sm text-muted-foreground font-mono">
+                {phase === "leaving" ? "GO GO GO" : "BOX BOX"}
+              </span>
+              {phase === "loading" && (
+                <span className="text-sm text-muted-foreground font-mono animate-[blink_1s_step-end_infinite]">|</span>
+              )}
+            </div>
+            <span className="text-xs text-muted-foreground/60 font-mono">
+              {phase === "leaving" ? `Strategy ready for #${driverNum}` : `Analyzing #${driverNum} ${driverName}`}
+            </span>
           </div>
         ) : (
           <>

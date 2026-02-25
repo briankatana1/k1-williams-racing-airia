@@ -3,6 +3,9 @@ import { NextResponse } from "next/server"
 const PIPELINES: Record<string, string | undefined> = {
   pit: process.env.AIRIA_PIPELINE_ID,
   chat: process.env.AIRIA_CHAT_PIPELINE_ID,
+  tension: process.env.AIRIA_TENSION_PIPELINE_ID,
+  telemetry: process.env.AIRIA_TELEMETRY_PIPELINE_ID,
+  tyre: process.env.AIRIA_TYRE_PIPELINE_ID,
 }
 
 export async function POST(request: Request) {

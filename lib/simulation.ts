@@ -24,9 +24,16 @@ export function getSessionsUrl(): string {
     : `${BASE}/sessions?session_key=latest`
 }
 
+// Rolling sim clock: starts at the env timestamp and advances in real-time
+const _simOrigin = process.env.NEXT_PUBLIC_SIM_TIME
+  ? new Date(process.env.NEXT_PUBLIC_SIM_TIME).getTime()
+  : null
+const _realOrigin = Date.now()
+
 export function now(): Date {
-  const simTime = process.env.NEXT_PUBLIC_SIM_TIME
-  return simTime ? new Date(simTime) : new Date()
+  if (_simOrigin == null) return new Date()
+  const elapsed = Date.now() - _realOrigin
+  return new Date(_simOrigin + elapsed)
 }
 
 export function getMeetingKey(): string {
@@ -55,16 +62,17 @@ export function sessionTypeToLabel(sessionType: string): string {
 }
 
 // Module-level cache: same OpenF1 URL → reuse the in-flight/resolved promise
-const _urlCache = new Map<string, Promise<any>>()
+// Entries expire after 30s so rolling sim time gets fresh data each poll
+const _urlCache = new Map<string, { promise: Promise<any>; ts: number }>()
 
 export function cachedFetch<T = any>(url: string): Promise<T> {
-  if (!_urlCache.has(url)) {
-    _urlCache.set(
-      url,
-      fetch(url)
-        .then((r) => { if (!r.ok) throw new Error(`${r.status}`); return r.json() })
-        .catch((err) => { _urlCache.delete(url); throw err })
-    )
+  const entry = _urlCache.get(url)
+  if (entry && Date.now() - entry.ts < 30_000) {
+    return entry.promise as Promise<T>
   }
-  return _urlCache.get(url)! as Promise<T>
+  const promise = fetch(url)
+    .then((r) => { if (!r.ok) throw new Error(`${r.status}`); return r.json() })
+    .catch((err) => { _urlCache.delete(url); throw err })
+  _urlCache.set(url, { promise, ts: Date.now() })
+  return promise as Promise<T>
 }

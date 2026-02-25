@@ -4,6 +4,7 @@ const BASE = "https://api.openf1.org/v1"
 
 export interface PitData {
   lastPitLap: number | null
+  pitDuration: number | null
   compound: string
   tyreAge: number
   position: number | null
@@ -37,7 +38,9 @@ export async function fetchPitData(driverNumber: number): Promise<PitData> {
   const stintStartLap: number = latestStint?.lap_start ?? 0
 
   // Last pit stop at or before current lap
-  const lastPitLap: number | null = pits.length > 0 ? pits[pits.length - 1].lap_number : null
+  const lastPit = pits.length > 0 ? pits[pits.length - 1] : null
+  const lastPitLap: number | null = lastPit?.lap_number ?? null
+  const pitDuration: number | null = lastPit?.pit_duration ?? null
 
   // Tyre age
   const tyreAge = stintStartLap > 0 ? Math.max(0, currentLap - stintStartLap) : 0
@@ -53,5 +56,5 @@ export async function fetchPitData(driverNumber: number): Promise<PitData> {
   const rainfall = latestWeather?.rainfall != null && latestWeather.rainfall > 0 ? "Rain" : "Dry"
   const weatherStr = `${airTemp}C / ${rainfall}`
 
-  return { lastPitLap, compound, tyreAge, position, gapToLeader, weather: weatherStr }
+  return { lastPitLap, pitDuration, compound, tyreAge, position, gapToLeader, weather: weatherStr }
 }

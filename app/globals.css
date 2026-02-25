@@ -142,3 +142,42 @@
   0% { background-position: 200% 0; }
   100% { background-position: -100% 0; }
 }
+
+/* Pit stop loading animation */
+@keyframes pitCarIn {
+  0% { transform: translateX(0); }
+  70% { transform: translateX(130px); }
+  85% { transform: translateX(118px); }
+  100% { transform: translateX(122px); }
+}
+
+@keyframes pitCarOut {
+  0% { transform: translateX(0); }
+  100% { transform: translateX(200px); }
+}
+
+@keyframes wheelSpin {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+
+@keyframes crewAppear {
+  0% { opacity: 0; transform: translateY(4px); }
+  100% { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes fadeInOut {
+  0%, 100% { opacity: 0; }
+  50% { opacity: 1; }
+}
+
+@keyframes tyreOff {
+  0% { opacity: 0; transform: translate(0, 0) rotate(0deg); }
+  30% { opacity: 1; }
+  100% { opacity: 0; transform: translate(20px, -16px) rotate(180deg); }
+}
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}

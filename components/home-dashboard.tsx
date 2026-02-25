@@ -1,10 +1,32 @@
 "use client"
 
-import { useState, useEffect, useCallback } from "react"
-import { ArrowLeft, TrendingUp, Activity, CircleDot, ChevronDown, ChevronUp } from "lucide-react"
+import { useState, useEffect, useReducer, useRef } from "react"
+import { ArrowLeft, TrendingUp, Activity, CircleDot, ChevronDown, ChevronUp, Loader2 } from "lucide-react"
 import Image from "next/image"
 import { DriverSelector, type DriverId } from "./driver-selector"
-import { getStartLap, getSessionsUrl, cachedFetch, sessionTypeToLabel } from "@/lib/simulation"
+import { getStartLap, getSessionKey, getSessionsUrl, cachedFetch, sessionTypeToLabel, now as simNow } from "@/lib/simulation"
+
+// Typewriter hook — reveals text word-by-word
+function useTypewriter(text: string, speed = 30): string {
+  const [displayed, setDisplayed] = useState("")
+  const prevTextRef = useRef("")
+
+  useEffect(() => {
+    if (!text || text === prevTextRef.current) return
+    prevTextRef.current = text
+    const words = text.split(/(\s+)/)
+    let i = 0
+    setDisplayed("")
+    const timer = setInterval(() => {
+      i++
+      setDisplayed(words.slice(0, i).join(""))
+      if (i >= words.length) clearInterval(timer)
+    }, speed)
+    return () => clearInterval(timer)
+  }, [text, speed])
+
+  return text ? displayed : ""
+}
 
 interface HomeDashboardProps {
   onBack: () => void
@@ -12,64 +34,347 @@ interface HomeDashboardProps {
 
 // --- Live Tension Tracker ---
 
-function TensionTracker({ driver }: { driver: DriverId }) {
-  const [lapData, setLapData] = useState<{ lap: number; gap: number }[]>([])
-  const [narrative, setNarrative] = useState("")
-  const [isLive, setIsLive] = useState(true)
+type TensionTier = "MONITORING" | "BUILDING" | "DRS_ZONE" | "IMMINENT"
 
-  const driverName = driver === "albon" ? "Albon" : "Sainz"
-  const driverNum = driver === "albon" ? "23" : "55"
-  const rivalName = driver === "albon" ? "Stroll" : "Gasly"
+interface CommentaryBullet {
+  id: string
+  text: string
+  tier: TensionTier
+  timestamp: number
+}
 
-  const generateNarrative = useCallback((data: { lap: number; gap: number }[]) => {
-    if (data.length < 3) return "Gathering lap data..."
-    const recent = data.slice(-3)
-    const trend = recent[2].gap - recent[0].gap
-    const currentGap = recent[2].gap
+interface GapSnapshot {
+  lap: number
+  gap: number
+  closingRate: number
+  drsActive: boolean
+}
 
-    if (trend < -0.4) {
-      const lapsToPass = Math.ceil(currentGap / (Math.abs(trend) / 3))
-      return `${driverName} is closing ${Math.abs(trend).toFixed(1)}s over the last 3 laps on ${rivalName}. Gap now ${currentGap.toFixed(1)}s — a pass could happen in ${lapsToPass} laps if this pace continues.`
-    } else if (trend < -0.1) {
-      return `${driverName} is slowly reeling in ${rivalName}. The gap is ${currentGap.toFixed(1)}s and shrinking — expect DRS range within 5-6 laps.`
-    } else if (trend > 0.3) {
-      return `${rivalName} has picked up the pace. The gap to ${driverName} has grown to ${currentGap.toFixed(1)}s. The team may consider an alternate strategy to recover.`
-    } else {
-      return `${driverName} and ${rivalName} are locked in a tense battle. Gap holding steady at ${currentGap.toFixed(1)}s — neither driver giving an inch.`
+interface OvertakeEvent {
+  id: string
+  lap: number
+  description: string
+  type: "ATTACKING" | "DEFENDING"
+  driverNumber: string
+}
+
+interface TensionState {
+  bullets: CommentaryBullet[]
+  gapHistory: GapSnapshot[]
+  overtakes: OvertakeEvent[]
+  lastOvertake: OvertakeEvent | null
+  loading: boolean
+  error: string | null
+}
+
+type TensionAction =
+  | { type: "FETCH_START" }
+  | { type: "INTERVALS_UPDATE"; gaps: GapSnapshot[]; overtakes: OvertakeEvent[] }
+  | { type: "AI_SUCCESS"; bullets: CommentaryBullet[] }
+  | { type: "FETCH_ERROR"; error: string }
+  | { type: "RESET" }
+
+function tensionReducer(state: TensionState, action: TensionAction): TensionState {
+  switch (action.type) {
+    case "FETCH_START":
+      return { ...state, loading: true, error: null }
+    case "INTERVALS_UPDATE": {
+      const existingDescs = new Set(state.overtakes.map((o) => o.description.toLowerCase().trim()))
+      const newOvertakes = action.overtakes.filter((o) => !existingDescs.has(o.description.toLowerCase().trim()))
+      return {
+        ...state,
+        gapHistory: action.gaps.slice(-12),
+        overtakes: [...state.overtakes, ...newOvertakes].slice(0, 20),
+        lastOvertake: newOvertakes.length > 0 ? newOvertakes[newOvertakes.length - 1] : state.lastOvertake,
+      }
     }
-  }, [driverName, rivalName])
+    case "AI_SUCCESS": {
+      const existingBullets = new Set(state.bullets.map((b) => b.text.toLowerCase().trim()))
+      const newBullets = action.bullets.filter((b) => !existingBullets.has(b.text.toLowerCase().trim()))
+      return {
+        ...state,
+        loading: false,
+        error: null,
+        bullets: [...newBullets, ...state.bullets].slice(0, 50),
+      }
+    }
+    case "FETCH_ERROR":
+      return { ...state, loading: false, error: action.error }
+    case "RESET":
+      return { bullets: [], gapHistory: [], overtakes: [], lastOvertake: null, loading: false, error: null }
+  }
+}
 
-  useEffect(() => {
-    setLapData([])
-    const startLap = getStartLap(24)
-    const initialData = Array.from({ length: 8 }, (_, i) => ({
-      lap: startLap + i,
-      gap: 2.8 - i * 0.25 + (Math.random() * 0.3 - 0.15),
-    }))
-    setLapData(initialData)
-    setNarrative(generateNarrative(initialData))
-  }, [driver, generateNarrative])
+const TIER_COLORS: Record<TensionTier, { dot: string; label: string; text: string }> = {
+  MONITORING: { dot: "bg-white/60", label: "text-muted-foreground", text: "text-muted-foreground" },
+  BUILDING: { dot: "bg-yellow-400", label: "text-amber-400", text: "text-amber-200" },
+  DRS_ZONE: { dot: "bg-emerald-400", label: "text-emerald-400", text: "text-emerald-200" },
+  IMMINENT: { dot: "bg-red-500", label: "text-red-400", text: "text-red-200" },
+}
 
-  useEffect(() => {
-    if (!isLive) return
-    const interval = setInterval(() => {
-      setLapData((prev) => {
-        const lastLap = prev.length > 0 ? prev[prev.length - 1].lap : 31
-        const lastGap = prev.length > 0 ? prev[prev.length - 1].gap : 1.0
-        const newGap = Math.max(0.1, lastGap - 0.2 + (Math.random() * 0.35 - 0.1))
-        const newData = [...prev.slice(-11), { lap: lastLap + 1, gap: newGap }]
-        setNarrative(generateNarrative(newData))
-        return newData
-      })
-    }, 4000)
-    return () => clearInterval(interval)
-  }, [isLive, driver, generateNarrative])
+// Module-level caches
+let _lastTensionFetchTime = 0
 
-  const maxGap = Math.max(...lapData.map((d) => d.gap), 3)
+function classifyTier(text: string): TensionTier {
+  const lower = text.toLowerCase()
+  // Extract gap numbers
+  const gapMatch = lower.match(/gap\s*(?:of\s+)?(\d+\.?\d*)\s*s|(\d+\.?\d*)\s*seconds?\s*(?:behind|ahead|gap)/i)
+  const gap = gapMatch ? parseFloat(gapMatch[1] ?? gapMatch[2]) : null
+
+  const overtakeKeywords = /\b(passed|overtook|overtaken|overtake|move|position gained|lunged|divebomb)\b/
+  if (gap !== null && gap <= 0.5 || overtakeKeywords.test(lower)) return "IMMINENT"
+  if (gap !== null && gap <= 1.0 || /\bdrs\b/.test(lower)) return "DRS_ZONE"
+  if (gap !== null && gap <= 2.0 || /\b(closing|pressure|attack)\b/.test(lower)) return "BUILDING"
+  return "MONITORING"
+}
+
+/** Build gap snapshots + detect overtakes directly from OpenF1 intervals data */
+function buildFromIntervals(
+  intervals: { interval: number | null; gap_to_leader: number | null; date: string }[],
+  laps: { lap_number: number; date_start: string }[],
+  driverNum: string,
+): { gaps: GapSnapshot[]; overtakes: OvertakeEvent[] } {
+  const gaps: GapSnapshot[] = []
+  const overtakes: OvertakeEvent[] = []
+
+  // Build a lookup: timestamp → real lap number
+  function toLap(dateStr: string): number {
+    const t = new Date(dateStr).getTime()
+    let best = getStartLap(30)
+    for (const l of laps) {
+      if (new Date(l.date_start).getTime() <= t) best = l.lap_number
+      else break
+    }
+    return best
+  }
+
+  // Only use entries that have a real interval value (gap to car ahead)
+  const valid = intervals.filter((r) => r.interval != null)
+
+  for (let i = 0; i < valid.length; i++) {
+    const r = valid[i]
+    const gap = r.interval!
+    const prevGap = i > 0 ? valid[i - 1].interval! : gap
+    const closingRate = prevGap - gap
+    const lap = toLap(r.date)
+
+    gaps.push({
+      lap: i, // index for sparkline ordering
+      gap: Math.abs(gap),
+      closingRate,
+      drsActive: Math.abs(gap) <= 1.0,
+    })
+
+    // Detect overtake: position change shows as a big interval discontinuity
+    if (i > 0) {
+      const prev = valid[i - 1].interval!
+      const curr = gap
+      const delta = curr - prev
+
+      if (prev <= 1.5 && delta > 2.0) {
+        overtakes.push({
+          id: `ot-${r.date}`,
+          lap,
+          description: `#${driverNum} overtook on lap ${lap} — gap was ${prev.toFixed(1)}s, now ${curr.toFixed(1)}s to next car ahead`,
+          type: "ATTACKING",
+          driverNumber: driverNum,
+        })
+      }
+      else if (prev > 2.0 && delta < -2.0 && curr <= 1.5) {
+        overtakes.push({
+          id: `ot-${r.date}`,
+          lap,
+          description: `#${driverNum} lost a position on lap ${lap} — interval dropped from ${prev.toFixed(1)}s to ${curr.toFixed(1)}s`,
+          type: "DEFENDING",
+          driverNumber: driverNum,
+        })
+      }
+    }
+  }
+
+  return { gaps, overtakes }
+}
+
+/* ---------- Zone 1: Commentary Feed ---------- */
+function CommentaryFeed({ bullets, loading }: { bullets: CommentaryBullet[]; loading: boolean }) {
+  return (
+    <div className="rounded-2xl border border-border bg-card overflow-hidden">
+      <div className="px-5 py-3 border-b border-border">
+        <span className="text-xs font-mono text-[#2563EB] uppercase tracking-wider">AI Commentary</span>
+      </div>
+      <div>
+        {loading && bullets.length === 0 && (
+          <div className="flex items-center gap-2 px-5 py-4 text-muted-foreground">
+            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            <span className="text-xs">Analyzing race tension...</span>
+          </div>
+        )}
+        {bullets.length === 0 && !loading && (
+          <p className="px-5 py-4 text-xs text-muted-foreground">Waiting for data...</p>
+        )}
+        <div className="flex flex-col">
+          {bullets.map((b) => {
+            const colors = TIER_COLORS[b.tier]
+            return (
+              <div key={b.id} className="flex items-start gap-2.5 px-5 py-2.5 border-b border-border/50 last:border-0">
+                <span className={`mt-1.5 w-2 h-2 rounded-full flex-shrink-0 ${colors.dot}`} />
+                <div className="min-w-0 flex-1">
+                  <span className={`text-[10px] font-mono uppercase tracking-wider ${colors.label}`}>{b.tier.replace("_", " ")}</span>
+                  <p className={`text-xs leading-relaxed mt-0.5 ${colors.text}`}>{b.text}</p>
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+/* ---------- Zone 2: Gap Visualizer ---------- */
+function GapVisualizer({ gapHistory, driverNum, overtakeLaps }: { gapHistory: GapSnapshot[]; driverNum: string; overtakeLaps: Set<number> }) {
+  const latest = gapHistory.length > 0 ? gapHistory[gapHistory.length - 1] : null
+  const maxGap = Math.max(...gapHistory.map((g) => g.gap), 3)
 
   return (
     <div className="rounded-2xl border border-border bg-card overflow-hidden">
-      <div className="flex items-center justify-between px-5 py-4 border-b border-border">
+      <div className="flex items-center justify-between px-5 py-3 border-b border-border">
+        <span className="text-xs font-mono text-[#2563EB] uppercase tracking-wider">Gap to Car Ahead</span>
+        <span className="text-[10px] font-mono text-muted-foreground">#{driverNum}</span>
+      </div>
+      <div className="p-5">
+        {gapHistory.length === 0 ? (
+          <p className="text-xs text-muted-foreground py-4 text-center">Gathering data...</p>
+        ) : (
+          <>
+            {/* Sparkline */}
+            <div className="relative h-24 mb-4 rounded-xl bg-secondary/40 border border-border p-3 overflow-hidden">
+              <div className="flex items-end gap-1 h-full">
+                {gapHistory.map((g, i) => {
+                  const height = (g.gap / maxGap) * 100
+                  const isClosing = i > 0 && g.gap < gapHistory[i - 1].gap
+                  const isOvertake = overtakeLaps.has(g.lap)
+                  return (
+                    <div key={`gap-${g.lap}`} className="flex-1 flex flex-col items-center gap-0.5 h-full justify-end">
+                      {isOvertake && (
+                        <span className="text-[8px] leading-none animate-pulse">⚡</span>
+                      )}
+                      <div
+                        className={`w-full rounded-t transition-all duration-500 ${isOvertake ? "ring-1 ring-amber-400/60" : ""}`}
+                        style={{
+                          height: `${height}%`,
+                          backgroundColor: isOvertake ? "#F59E0B" : isClosing ? "#2563EB" : "#1C2B50",
+                          minHeight: "4px",
+                        }}
+                      />
+                    </div>
+                  )
+                })}
+              </div>
+              {/* DRS threshold line */}
+              <div
+                className="absolute left-3 right-3 border-t border-dashed border-emerald-400/40"
+                style={{ bottom: `${(1.0 / maxGap) * 100 * 0.72 + 8}%` }}
+              >
+                <span className="absolute -top-3 right-0 text-[9px] text-emerald-400/60 font-mono">DRS</span>
+              </div>
+            </div>
+
+            {/* Stats row */}
+            <div className="grid grid-cols-3 gap-3">
+              <div className="flex flex-col items-center gap-1 px-3 py-3 rounded-xl bg-secondary/60 border border-border">
+                <span className="text-[10px] text-muted-foreground uppercase tracking-wider">Gap</span>
+                <span className="text-base font-mono font-bold text-foreground">{latest?.gap.toFixed(1) ?? "—"}s</span>
+              </div>
+              <div className="flex flex-col items-center gap-1 px-3 py-3 rounded-xl bg-secondary/60 border border-border">
+                <span className="text-[10px] text-muted-foreground uppercase tracking-wider">Rate</span>
+                <span className={`text-base font-mono font-bold ${(latest?.closingRate ?? 0) > 0 ? "text-emerald-400" : (latest?.closingRate ?? 0) < 0 ? "text-red-400" : "text-muted-foreground"}`}>
+                  {latest ? `${latest.closingRate > 0 ? "+" : ""}${latest.closingRate.toFixed(2)}` : "—"}
+                </span>
+              </div>
+              <div className="flex flex-col items-center gap-1 px-3 py-3 rounded-xl bg-secondary/60 border border-border">
+                <span className="text-[10px] text-muted-foreground uppercase tracking-wider">DRS</span>
+                <span className={`text-base font-mono font-bold ${latest?.drsActive ? "text-emerald-400" : "text-muted-foreground"}`}>
+                  {latest?.drsActive ? "ACTIVE" : "———"}
+                </span>
+              </div>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  )
+}
+
+/* ---------- Zone 3: Overtake Log ---------- */
+function OvertakeLog({ overtakes }: { overtakes: OvertakeEvent[] }) {
+  return (
+    <div className="rounded-2xl border border-border bg-card overflow-hidden">
+      <div className="flex items-center justify-between px-5 py-3 border-b border-border">
+        <span className="text-xs font-mono text-[#2563EB] uppercase tracking-wider">Overtake Log</span>
+        <span className="text-[10px] font-mono text-muted-foreground">{overtakes.length} events</span>
+      </div>
+      <div className="p-5">
+        {overtakes.length === 0 ? (
+          <p className="text-xs text-muted-foreground text-center py-4">No overtakes detected yet</p>
+        ) : (
+          <div className="flex flex-col gap-2">
+            {overtakes.map((ev) => (
+              <div key={ev.id} className="flex items-start gap-3 px-4 py-3 rounded-xl bg-secondary/60 border border-border">
+                <span className="px-2 py-0.5 rounded-md bg-[#2563EB]/10 text-[#2563EB] text-[10px] font-mono border border-[#2563EB]/20 flex-shrink-0">
+                  L{ev.lap}
+                </span>
+                <p className="flex-1 text-xs text-foreground/90 leading-relaxed min-w-0">{ev.description}</p>
+                <span className={`px-2 py-0.5 rounded-full text-[10px] font-mono uppercase tracking-wider flex-shrink-0 ${
+                  ev.type === "ATTACKING"
+                    ? "bg-emerald-400/10 text-emerald-400 border border-emerald-400/20"
+                    : "bg-red-400/10 text-red-400 border border-red-400/20"
+                }`}>
+                  {ev.type === "ATTACKING" ? "ATK" : "DEF"}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+/* ---------- Overtake Flash Banner ---------- */
+function OvertakeFlash({ event }: { event: OvertakeEvent }) {
+  const isAttack = event.type === "ATTACKING"
+  return (
+    <div className={`rounded-2xl border overflow-hidden animate-pulse ${
+      isAttack
+        ? "border-emerald-400/40 bg-emerald-400/10"
+        : "border-red-400/40 bg-red-400/10"
+    }`}>
+      <div className="flex items-center gap-3 px-5 py-3">
+        <span className="text-lg">⚡</span>
+        <div className="flex-1 min-w-0">
+          <span className={`text-[10px] font-mono uppercase tracking-wider ${isAttack ? "text-emerald-400" : "text-red-400"}`}>
+            {isAttack ? "OVERTAKE" : "POSITION LOST"} — LAP {event.lap}
+          </span>
+          <p className="text-xs text-foreground/90 mt-0.5 truncate">{event.description}</p>
+        </div>
+        <span className={`px-2 py-0.5 rounded-full text-[10px] font-mono uppercase tracking-wider flex-shrink-0 ${
+          isAttack
+            ? "bg-emerald-400/20 text-emerald-400 border border-emerald-400/30"
+            : "bg-red-400/20 text-red-400 border border-red-400/30"
+        }`}>
+          {isAttack ? "ATK" : "DEF"}
+        </span>
+      </div>
+    </div>
+  )
+}
+
+/* ---------- Tension Header ---------- */
+function TensionHeader({ isLive, onToggle, loading, analyzeRef }: { isLive: boolean; onToggle: () => void; loading: boolean; analyzeRef: React.RefObject<() => void> }) {
+  return (
+    <div className="rounded-2xl border border-border bg-card overflow-hidden">
+      <div className="flex items-center justify-between px-5 py-4">
         <div className="flex items-center gap-3">
           <div className="w-10 h-10 rounded-lg bg-[#2563EB]/10 flex items-center justify-center border border-[#2563EB]/20">
             <TrendingUp className="w-5 h-5 text-[#2563EB]" />
@@ -79,59 +384,173 @@ function TensionTracker({ driver }: { driver: DriverId }) {
             <p className="text-xs text-muted-foreground">Gap + Overtake Analysis</p>
           </div>
         </div>
-        <button
-          onClick={() => setIsLive(!isLive)}
-          className="flex items-center gap-2"
-        >
-          <span className={`w-2 h-2 rounded-full ${isLive ? "bg-emerald-400 animate-pulse" : "bg-muted-foreground"}`} />
-          <span className={`text-xs font-mono ${isLive ? "text-emerald-400" : "text-muted-foreground"}`}>
-            {isLive ? "LIVE" : "PAUSED"}
-          </span>
-        </button>
-      </div>
-
-      <div className="p-5">
-        {/* Mini chart */}
-        <div className="relative h-28 mb-4 rounded-xl bg-secondary/40 border border-border p-3 overflow-hidden">
-          <div className="absolute top-2 left-3 text-[10px] text-muted-foreground font-mono">
-            GAP TO {rivalName.toUpperCase()} (s)
-          </div>
-          <div className="absolute bottom-2 right-3 text-[10px] text-muted-foreground font-mono">
-            #{driverNum}
-          </div>
-          {/* Chart bars */}
-          <div className="flex items-end gap-1 h-full pt-4 pb-1">
-            {lapData.map((d, i) => {
-              const height = (d.gap / maxGap) * 100
-              const isClosing = i > 0 && d.gap < lapData[i - 1].gap
-              return (
-                <div
-                  key={`${driver}-${d.lap}`}
-                  className="flex-1 rounded-t transition-all duration-500"
-                  style={{
-                    height: `${height}%`,
-                    backgroundColor: isClosing ? "#2563EB" : "#1C2B50",
-                    minHeight: "4px",
-                  }}
-                />
-              )
-            })}
-          </div>
-          {/* DRS zone line */}
-          <div
-            className="absolute left-3 right-3 border-t border-dashed border-emerald-400/40"
-            style={{ bottom: `${(1.0 / maxGap) * 100 * 0.72 + 8}%` }}
+        <div className="flex items-center gap-3">
+          <button
+            onClick={() => analyzeRef.current()}
+            disabled={loading}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#2563EB] text-white text-xs font-medium disabled:opacity-40 disabled:cursor-not-allowed hover:bg-[#2563EB]/90 transition-colors"
           >
-            <span className="absolute -top-3 right-0 text-[9px] text-emerald-400/60 font-mono">DRS</span>
-          </div>
-        </div>
-
-        {/* Narrative */}
-        <div className="rounded-xl bg-[#2563EB]/5 border border-[#2563EB]/15 p-4">
-          <span className="text-xs font-mono text-[#2563EB] uppercase tracking-wider">AI Narrative</span>
-          <p className="mt-2 text-sm text-foreground/90 leading-relaxed">{narrative}</p>
+            {loading ? <Loader2 className="w-3 h-3 animate-spin" /> : <TrendingUp className="w-3 h-3" />}
+            {loading ? "Analyzing..." : "Analyze"}
+          </button>
+          <button onClick={onToggle} className="flex items-center gap-2">
+            <span className={`w-2 h-2 rounded-full ${isLive ? "bg-emerald-400 animate-pulse" : "bg-muted-foreground"}`} />
+            <span className={`text-xs font-mono ${isLive ? "text-emerald-400" : "text-muted-foreground"}`}>
+              {isLive ? "LIVE" : "PAUSED"}
+            </span>
+          </button>
         </div>
       </div>
+    </div>
+  )
+}
+
+/* ---------- Main TensionTracker ---------- */
+function TensionTracker({ driver }: { driver: DriverId }) {
+  const [state, dispatch] = useReducer(tensionReducer, {
+    bullets: [],
+    gapHistory: [],
+    overtakes: [],
+    lastOvertake: null,
+    loading: false,
+    error: null,
+  })
+  const [isLive, setIsLive] = useState(true)
+  const prevDriverRef = useRef(driver)
+
+  const driverName = driver === "albon" ? "Albon" : "Sainz"
+  const driverNum = driver === "albon" ? "23" : "55"
+
+  // Reset on driver change
+  useEffect(() => {
+    if (prevDriverRef.current !== driver) {
+      prevDriverRef.current = driver
+      dispatch({ type: "RESET" })
+      _lastTensionFetchTime = 0
+    }
+  }, [driver])
+
+  // Fetch intervals/laps from OpenF1 every 60s (no AI call — that's button-only)
+  useEffect(() => {
+    let stale = false
+    let firstFetch = true
+
+    async function fetchIntervals() {
+      if (document.hidden) return
+      if (!firstFetch) {
+        const sinceLast = Date.now() - _lastTensionFetchTime
+        if (_lastTensionFetchTime > 0 && sinceLast < 60_000) return
+      }
+      firstFetch = false
+      _lastTensionFetchTime = Date.now()
+      const sessionKey = getSessionKey()
+      const simTime = simNow().toISOString()
+
+      try {
+        const [intData, lapData] = await Promise.all([
+          cachedFetch<any[]>(`https://api.openf1.org/v1/intervals?session_key=${sessionKey}&driver_number=${driverNum}&date%3C=${encodeURIComponent(simTime)}`).catch(() => []),
+          cachedFetch<any[]>(`https://api.openf1.org/v1/laps?session_key=${sessionKey}&driver_number=${driverNum}`).catch(() => []),
+        ])
+
+        if (!stale && Array.isArray(intData) && intData.length > 0) {
+          const recent = intData.slice(-12)
+          const { gaps, overtakes } = buildFromIntervals(recent, lapData, driverNum)
+          dispatch({ type: "INTERVALS_UPDATE", gaps, overtakes })
+        }
+      } catch {
+        // Non-critical
+      }
+    }
+
+    fetchIntervals()
+
+    const interval = isLive ? setInterval(fetchIntervals, 60_000) : null
+
+    function onVisChange() {
+      if (!document.hidden && isLive && !stale) fetchIntervals()
+    }
+    document.addEventListener("visibilitychange", onVisChange)
+
+    return () => {
+      stale = true
+      if (interval) clearInterval(interval)
+      document.removeEventListener("visibilitychange", onVisChange)
+    }
+  }, [isLive, driver, driverNum])
+
+  // AI commentary — triggered manually via Analyze button
+  const analyzeRef = useRef<() => void>(() => {})
+  analyzeRef.current = () => {
+    if (state.loading) return
+
+    dispatch({ type: "FETCH_START" })
+
+    const currentLap = getStartLap(30)
+    const totalLaps = 58
+    const lapsRemaining = totalLaps - currentLap
+
+    const intervalSnippet = state.gapHistory.length > 0
+      ? state.gapHistory.map((g) => `lap=${g.lap} gap=${g.gap.toFixed(2)}s closing=${g.closingRate.toFixed(2)}s/lap drs=${g.drsActive}`).join("; ")
+      : "No interval data available."
+
+    const prompt = `Analyze race tension for Williams driver ${driverName} #${driverNum}, lap ${currentLap}/${totalLaps} (${lapsRemaining} remaining).
+
+Here is the latest interval data (already fetched, do NOT call the Get intervals tool):
+${intervalSnippet}
+
+Based on this data, provide brief bullet-point commentary on gap closures, DRS proximity, and overtake opportunities.`
+
+    fetch("/api/airia", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ userInput: prompt, pipeline: "tension" }),
+    })
+      .then((r) => r.json())
+      .then((data) => {
+        if (data.error) {
+          dispatch({ type: "FETCH_ERROR", error: data.error })
+          return
+        }
+
+        const raw: string = data.result ?? data.output ?? data.response ?? (typeof data === "string" ? data : "")
+        if (!raw) {
+          dispatch({ type: "FETCH_ERROR", error: "Empty response from AI" })
+          return
+        }
+
+        const lines = raw.split("\n").map((l: string) => l.replace(/^[\s\-\*•\d.]+/, "").trim()).filter((l: string) => l.length > 10)
+        const bullets: CommentaryBullet[] = lines.map((text: string) => ({
+          id: `b-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          text,
+          tier: classifyTier(text),
+          timestamp: Date.now(),
+        }))
+
+        dispatch({ type: "AI_SUCCESS", bullets })
+      })
+      .catch(() => {
+        dispatch({ type: "FETCH_ERROR", error: "Failed to reach tension analysis" })
+      })
+  }
+
+  const overtakeLaps = new Set(state.overtakes.map((o) => o.lap))
+  const [flashEvent, setFlashEvent] = useState<OvertakeEvent | null>(null)
+
+  // Show flash banner when a new overtake is detected
+  useEffect(() => {
+    if (!state.lastOvertake) return
+    setFlashEvent(state.lastOvertake)
+    const timer = setTimeout(() => setFlashEvent(null), 4000)
+    return () => clearTimeout(timer)
+  }, [state.lastOvertake])
+
+  return (
+    <div className="flex flex-col gap-4">
+      <TensionHeader isLive={isLive} onToggle={() => setIsLive(!isLive)} loading={state.loading} analyzeRef={analyzeRef} />
+      {flashEvent && <OvertakeFlash event={flashEvent} />}
+      <CommentaryFeed bullets={state.bullets} loading={state.loading} />
+      <GapVisualizer gapHistory={state.gapHistory} driverNum={driverNum} overtakeLaps={overtakeLaps} />
+      <OvertakeLog overtakes={state.overtakes} />
     </div>
   )
 }
@@ -139,32 +558,385 @@ function TensionTracker({ driver }: { driver: DriverId }) {
 
 // --- Telemetry Storyteller ---
 
+interface CarDataReading {
+  throttle: number
+  brake: number
+  speed: number
+  rpm: number
+  n_gear: number
+  drs: number
+}
+
+interface CircuitCorner {
+  number: number
+  trackPosition: { x: number; y: number }
+  angle: number
+  length: number
+}
+
+interface CircuitLayout {
+  x: number[]
+  y: number[]
+  corners: CircuitCorner[]
+  rotation: number
+}
+
+interface DriverPosition {
+  x: number
+  y: number
+}
+
+interface TelemetryState {
+  reading: CarDataReading | null
+  gForce: number | null
+  driverPos: DriverPosition | null
+  narrative: string
+  detail: string
+  activeCorner: number | null
+  loading: boolean
+  error: string | null
+}
+
+// Module-level caches
+const _telemetryFetchCache = new Map<string, Promise<any>>()
+let _circuitLayoutCache: Promise<CircuitLayout | null> | null = null
+let _lastTelemetryPollTime = 0
+
+function fetchCircuitLayout(): Promise<CircuitLayout | null> {
+  if (!_circuitLayoutCache) {
+    _circuitLayoutCache = fetch("/api/circuit")
+      .then((r) => {
+        if (!r.ok) throw new Error(`Circuit API ${r.status}`)
+        return r.json()
+      })
+      .catch((err) => {
+        _circuitLayoutCache = null
+        console.warn("Failed to load circuit layout:", err)
+        return null
+      })
+  }
+  return _circuitLayoutCache
+}
+
+function findNearestCorner(pos: DriverPosition, corners: CircuitCorner[]): number | null {
+  if (!corners.length) return null
+  let best = corners[0]
+  let bestDist = Infinity
+  for (const c of corners) {
+    const dx = pos.x - c.trackPosition.x
+    const dy = pos.y - c.trackPosition.y
+    const d = dx * dx + dy * dy
+    if (d < bestDist) { bestDist = d; best = c }
+  }
+  // Only highlight if driver is within ~200m of the corner (squared distance threshold)
+  if (bestDist > 200 * 200) return null
+  return best.number
+}
+
+function MiniTrackMap({ layout, activeCorner, driverPos }: { layout: CircuitLayout | null; activeCorner: number | null; driverPos: DriverPosition | null }) {
+  if (!layout || !layout.x || layout.x.length === 0) return null
+
+  // Downsample to ~200 points for performance
+  const step = Math.max(1, Math.floor(layout.x.length / 200))
+  const points: { x: number; y: number }[] = []
+  for (let i = 0; i < layout.x.length; i += step) {
+    points.push({ x: layout.x[i], y: layout.y[i] })
+  }
+
+  // Use full (non-downsampled) bounds so corners align
+  const minX = Math.min(...layout.x)
+  const maxX = Math.max(...layout.x)
+  const minY = Math.min(...layout.y)
+  const maxY = Math.max(...layout.y)
+  const padding = 200
+  const rawW = maxX - minX + padding * 2
+  const rawH = maxY - minY + padding * 2
+
+  const pathD = points
+    .map((p, i) => `${i === 0 ? "M" : "L"}${p.x - minX + padding},${p.y - minY + padding}`)
+    .join(" ") + " Z"
+
+  // Apply rotation inside SVG and compute tight bounding box of rotated content
+  const rotation = layout.rotation ?? 280
+  const rad = (rotation * Math.PI) / 180
+  const cosR = Math.cos(rad)
+  const sinR = Math.sin(rad)
+  const centerX = rawW / 2
+  const centerY = rawH / 2
+
+  // Rotate all outline points + corner positions to find the tight rotated bounding box
+  const allPts: { x: number; y: number }[] = [
+    ...points.map((p) => ({ x: p.x - minX + padding, y: p.y - minY + padding })),
+    ...(layout.corners ?? []).map((c) => ({ x: c.trackPosition.x - minX + padding, y: c.trackPosition.y - minY + padding })),
+  ]
+  let rMinX = Infinity, rMaxX = -Infinity, rMinY = Infinity, rMaxY = -Infinity
+  for (const p of allPts) {
+    const dx = p.x - centerX, dy = p.y - centerY
+    const rx = dx * cosR - dy * sinR + centerX
+    const ry = dx * sinR + dy * cosR + centerY
+    if (rx < rMinX) rMinX = rx
+    if (rx > rMaxX) rMaxX = rx
+    if (ry < rMinY) rMinY = ry
+    if (ry > rMaxY) rMaxY = ry
+  }
+  const rotPad = 150
+  const vbX = rMinX - rotPad
+  const vbY = rMinY - rotPad
+  const vbW = rMaxX - rMinX + rotPad * 2
+  const vbH = rMaxY - rMinY + rotPad * 2
+
+  // Scale factors for corner dots / text relative to viewbox size
+  const refSize = Math.max(vbW, vbH)
+  const dotR = refSize / 80
+  const fontSize = refSize / 60
+
+  return (
+    <div className="rounded-xl bg-secondary/40 border border-border p-3 mb-4">
+      <span className="text-[10px] text-muted-foreground uppercase tracking-wider mb-2 block">Track Map</span>
+      <svg
+        viewBox={`${vbX} ${vbY} ${vbW} ${vbH}`}
+        className="w-full"
+        style={{ maxHeight: "22rem" }}
+        preserveAspectRatio="xMidYMid meet"
+      >
+        <g transform={`rotate(${rotation},${centerX},${centerY})`}>
+          {/* Track outline */}
+          <path d={pathD} fill="none" stroke="currentColor" strokeWidth={Math.max(8, refSize / 200)} className="text-border" strokeLinecap="round" strokeLinejoin="round" />
+          <path d={pathD} fill="none" stroke="currentColor" strokeWidth={Math.max(3, refSize / 500)} className="text-muted-foreground/40" strokeLinecap="round" strokeLinejoin="round" />
+
+          {/* Corner markers */}
+          {(layout.corners ?? []).map((c) => {
+            const cx = c.trackPosition.x - minX + padding
+            const cy = c.trackPosition.y - minY + padding
+            const isActive = activeCorner === c.number
+            return (
+              <g key={c.number}>
+                {isActive && (
+                  <>
+                    <circle cx={cx} cy={cy} r={dotR * 3} fill="#EF4444" opacity={0.3} className="animate-ping" />
+                    <circle cx={cx} cy={cy} r={dotR * 1.6} fill="#EF4444" className="animate-pulse" />
+                  </>
+                )}
+                <circle cx={cx} cy={cy} r={isActive ? dotR * 1.4 : dotR} fill={isActive ? "#EF4444" : "#2563EB"} opacity={isActive ? 1 : 0.6} />
+                <text
+                  x={cx}
+                  y={cy}
+                  textAnchor="middle"
+                  dominantBaseline="central"
+                  fill="white"
+                  fontSize={isActive ? fontSize * 1.1 : fontSize}
+                  fontWeight="bold"
+                  fontFamily="monospace"
+                  transform={`rotate(${-rotation},${cx},${cy})`}
+                >
+                  {c.number}
+                </text>
+              </g>
+            )
+          })}
+
+          {/* Driver position */}
+          {driverPos && (() => {
+            const dx = driverPos.x - minX + padding
+            const dy = driverPos.y - minY + padding
+            return (
+              <g>
+                <circle cx={dx} cy={dy} r={dotR * 4} fill="#EF4444" opacity={0.2} className="animate-ping" />
+                <circle cx={dx} cy={dy} r={dotR * 2} fill="#EF4444" className="animate-pulse" />
+                <circle cx={dx} cy={dy} r={dotR * 1.5} fill="#EF4444" stroke="white" strokeWidth={dotR * 0.4} />
+              </g>
+            )
+          })()}
+        </g>
+      </svg>
+    </div>
+  )
+}
+
 function TelemetryStoryteller({ driver }: { driver: DriverId }) {
   const [expanded, setExpanded] = useState(false)
+  const [state, setState] = useState<TelemetryState>({
+    reading: null,
+    gForce: null,
+    driverPos: null,
+    narrative: "",
+    detail: "",
+    activeCorner: null,
+    loading: false,
+    error: null,
+  })
+  const [circuit, setCircuit] = useState<CircuitLayout | null>(null)
+  const prevDriverRef = useRef(driver)
 
   const driverName = driver === "albon" ? "Albon" : "Sainz"
+  const driverNum = driver === "albon" ? "23" : "55"
 
-  const telemetry = driver === "albon"
-    ? {
-        throttle: 87,
-        brake: 12,
-        speed: 298,
-        rpm: 11200,
-        drs: true,
-        gear: 8,
-        story: "Albon is absolutely flat out through the main straight — 87% throttle, DRS wide open, hitting 298 km/h. That is like going from London to Edinburgh in about an hour. The DRS flap on the rear wing is open, reducing drag and giving him an extra 10-15 km/h advantage on the car ahead.",
-        detail: "His braking is incredibly late into Turn 1 — just 12% brake pressure at this point means he is still carrying enormous speed. The engine is screaming at 11,200 RPM in 8th gear. Every fraction of a second counts here.",
+  // Reset on driver change
+  useEffect(() => {
+    if (prevDriverRef.current !== driver) {
+      prevDriverRef.current = driver
+      setState({ reading: null, gForce: null, driverPos: null, narrative: "", detail: "", activeCorner: null, loading: false, error: null })
+      _telemetryFetchCache.clear()
+      _lastTelemetryPollTime = 0
+      setExpanded(false)
+    }
+  }, [driver])
+
+  // Load circuit layout once (cached forever)
+  useEffect(() => {
+    let stale = false
+    fetchCircuitLayout().then((layout) => {
+      if (!stale && layout) setCircuit(layout)
+    })
+    return () => { stale = true }
+  }, [])
+
+  // Poll car_data + location every 60s, only when page is visible, with cooldown
+  useEffect(() => {
+    let stale = false
+    let timer: ReturnType<typeof setTimeout> | null = null
+    let firstFetch = true
+
+    async function pollData() {
+      if (document.hidden) return
+      if (!firstFetch) {
+        const sinceLast = Date.now() - _lastTelemetryPollTime
+        if (_lastTelemetryPollTime > 0 && sinceLast < 60_000) return
       }
-    : {
-        throttle: 42,
-        brake: 78,
-        speed: 124,
-        rpm: 8800,
-        drs: false,
-        gear: 3,
-        story: "Sainz is in the heavy braking zone — 78% brake force as he scrubs off speed from 310 km/h. That is like stopping a bullet train. He has downshifted to 3rd gear, the engine acting as a brake too. The car is pulling nearly 5G under braking — his neck is holding the weight of a small child.",
-        detail: "With DRS closed in the braking zone, the rear wing is providing maximum downforce for stability. At 42% throttle, Sainz is already preparing to get back on the power for the corner exit. Incredibly precise driving.",
+      firstFetch = false
+      _lastTelemetryPollTime = Date.now()
+
+      const sessionKey = getSessionKey()
+      const simTime = simNow()
+      const simIso = simTime.toISOString()
+      const tenSecAgo = new Date(simTime.getTime() - 10_000).toISOString()
+
+      let reading: CarDataReading | null = null
+      let gForce: number | null = null
+      let driverPos: DriverPosition | null = null
+      try {
+        const carUrl = `https://api.openf1.org/v1/car_data?session_key=${sessionKey}&driver_number=${driverNum}&date%3C=${encodeURIComponent(simIso)}&date%3E=${encodeURIComponent(tenSecAgo)}`
+        const locUrl = `https://api.openf1.org/v1/location?session_key=${sessionKey}&driver_number=${driverNum}&date%3C=${encodeURIComponent(simIso)}&date%3E=${encodeURIComponent(tenSecAgo)}`
+        const [carData, locData] = await Promise.all([
+          cachedFetch<any[]>(carUrl).catch(() => []),
+          cachedFetch<any[]>(locUrl).catch(() => []),
+        ])
+        if (Array.isArray(carData) && carData.length > 0) {
+          const latest = carData[carData.length - 1]
+          reading = {
+            throttle: latest.throttle ?? 0,
+            brake: latest.brake ?? 0,
+            speed: latest.speed ?? 0,
+            rpm: latest.rpm ?? 0,
+            n_gear: latest.n_gear ?? 0,
+            drs: latest.drs ?? 0,
+          }
+          if (carData.length >= 2) {
+            const prev = carData[carData.length - 2]
+            const dtMs = new Date(latest.date).getTime() - new Date(prev.date).getTime()
+            if (dtMs > 0) {
+              const dvMs2 = ((latest.speed ?? 0) - (prev.speed ?? 0)) / 3.6
+              gForce = Math.round(Math.abs(dvMs2 / (dtMs / 1000) / 9.81) * 10) / 10
+            }
+          }
+        }
+        if (Array.isArray(locData) && locData.length > 0) {
+          const latest = locData[locData.length - 1]
+          if (latest.x != null && latest.y != null) {
+            driverPos = { x: latest.x, y: latest.y }
+          }
+        }
+      } catch {
+        // Non-critical
       }
+
+      if (!stale && reading) {
+        const activeCorner = driverPos && circuit ? findNearestCorner(driverPos, circuit.corners ?? []) : null
+        setState((prev) => ({ ...prev, reading, gForce, driverPos, activeCorner: activeCorner ?? prev.activeCorner }))
+      }
+    }
+
+    function schedule() {
+      timer = setTimeout(async () => {
+        await pollData()
+        if (!stale) schedule()
+      }, 60_000)
+    }
+
+    pollData().then(() => { if (!stale) schedule() })
+
+    function onVisChange() {
+      if (!document.hidden && !stale) pollData()
+    }
+    document.addEventListener("visibilitychange", onVisChange)
+
+    return () => {
+      stale = true
+      if (timer) clearTimeout(timer)
+      document.removeEventListener("visibilitychange", onVisChange)
+    }
+  }, [driver, driverNum])
+
+  // AI narrative — triggered manually via button
+  const analyzeRef = useRef<() => void>(() => {})
+  analyzeRef.current = () => {
+    const r = state.reading
+    if (!r || state.loading) return
+
+    setState((prev) => ({ ...prev, loading: true }))
+
+    const drsLabel = r.drs >= 10 ? "OPEN" : "CLOSED"
+    const brakeLabel = r.brake >= 50 ? "ON (heavy braking)" : "OFF"
+    const nearTurn = state.activeCorner ? `The driver is currently near Turn ${state.activeCorner}.` : ""
+    const prompt = `You are a Formula 1 telemetry analyst for Williams Racing. Here is the latest car data for ${driverName} #${driverNum}:
+
+Throttle: ${r.throttle}%, Brake: ${brakeLabel}, Speed: ${r.speed} km/h, RPM: ${r.rpm}, Gear: ${r.n_gear}, DRS: ${drsLabel}
+${nearTurn}
+
+Do NOT call any tools. Write exactly 2 paragraphs:
+Paragraph 1: What the driver is doing right now at this point on the Yas Marina circuit. Reference the actual Turn number provided above.
+Paragraph 2: Deeper technical detail about the car behavior and what this means for performance.`
+
+    const cacheKey = `${driver}-${Date.now()}`
+    _telemetryFetchCache.set(
+      cacheKey,
+      fetch("/api/airia", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ userInput: prompt, pipeline: "telemetry" }),
+      })
+        .then((res) => res.json())
+        .catch((err) => {
+          _telemetryFetchCache.delete(cacheKey)
+          throw err
+        }),
+    )
+
+    _telemetryFetchCache.get(cacheKey)!
+      .then((data) => {
+        if (data.error) {
+          setState((prev) => ({ ...prev, loading: false, error: data.error }))
+          return
+        }
+        const raw: string = data.result ?? data.output ?? data.response ?? (typeof data === "string" ? data : "")
+        if (!raw) {
+          setState((prev) => ({ ...prev, loading: false, error: "Empty response from AI" }))
+          return
+        }
+        const paragraphs = raw.split(/\n\n+/).map((p: string) => p.trim()).filter((p: string) => p.length > 20)
+        const narrative = paragraphs[0] ?? raw
+        const detail = paragraphs[1] ?? ""
+        setState((prev) => ({ ...prev, narrative, detail, loading: false, error: null }))
+      })
+      .catch(() => {
+        setState((prev) => ({ ...prev, loading: false, error: "Failed to reach telemetry analysis" }))
+      })
+  }
+
+  const r = state.reading
+  const drsOpen = r ? r.drs >= 10 : false
+  const typedNarrative = useTypewriter(state.narrative)
+  const typedDetail = useTypewriter(state.detail)
 
   return (
     <div className="rounded-2xl border border-border bg-card overflow-hidden">
@@ -178,50 +950,99 @@ function TelemetryStoryteller({ driver }: { driver: DriverId }) {
             <p className="text-xs text-muted-foreground">Car Data Explained</p>
           </div>
         </div>
+        <div className="flex items-center gap-2">
+          {r ? (
+            <span className="px-2.5 py-0.5 rounded-full bg-[#2563EB]/10 text-[#2563EB] text-xs font-mono border border-[#2563EB]/20">
+              {r.speed} km/h
+            </span>
+          ) : (
+            <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
+              <Loader2 className="w-3 h-3 animate-spin" />
+              Fetching data…
+            </span>
+          )}
+          {state.loading && <Loader2 className="w-4 h-4 text-muted-foreground animate-spin" />}
+        </div>
       </div>
 
       <div className="p-5">
         {/* Telemetry Gauges */}
         <div className="grid grid-cols-3 gap-3 mb-4">
-          <GaugeCell label="Throttle" value={`${telemetry.throttle}%`} percent={telemetry.throttle} color="#22C55E" />
-          <GaugeCell label="Brake" value={`${telemetry.brake}%`} percent={telemetry.brake} color="#FF4444" />
-          <GaugeCell label="Speed" value={`${telemetry.speed}`} unit="km/h" percent={(telemetry.speed / 350) * 100} color="#2563EB" />
+          <GaugeCell label="Throttle" value={`${r?.throttle ?? 0}%`} percent={r?.throttle ?? 0} color="#22C55E" />
+          <GaugeCell label="Brake" value={(r?.brake ?? 0) >= 50 ? "ON" : "OFF"} percent={r?.brake ?? 0} color="#FF4444" />
+          <GaugeCell label="Speed" value={`${r?.speed ?? 0}`} unit="km/h" percent={((r?.speed ?? 0) / 350) * 100} color="#2563EB" />
         </div>
 
-        <div className="grid grid-cols-3 gap-3 mb-4">
-          <div className="flex flex-col items-center gap-1 px-3 py-3 rounded-xl bg-secondary/60 border border-border">
+        <div className="grid grid-cols-4 gap-3 mb-4">
+          <div className="flex flex-col items-center gap-1 px-2 py-3 rounded-xl bg-secondary/60 border border-border">
             <span className="text-[10px] text-muted-foreground uppercase tracking-wider">RPM</span>
-            <span className="text-base font-mono font-bold text-foreground">{telemetry.rpm.toLocaleString()}</span>
+            <span className="text-sm font-mono font-bold text-foreground">{(r?.rpm ?? 0).toLocaleString()}</span>
           </div>
-          <div className="flex flex-col items-center gap-1 px-3 py-3 rounded-xl bg-secondary/60 border border-border">
+          <div className="flex flex-col items-center gap-1 px-2 py-3 rounded-xl bg-secondary/60 border border-border">
             <span className="text-[10px] text-muted-foreground uppercase tracking-wider">Gear</span>
-            <span className="text-base font-mono font-bold text-foreground">{telemetry.gear}</span>
+            <span className="text-sm font-mono font-bold text-foreground">{r?.n_gear ?? 0}</span>
           </div>
-          <div className="flex flex-col items-center gap-1 px-3 py-3 rounded-xl bg-secondary/60 border border-border">
+          <div className="flex flex-col items-center gap-1 px-2 py-3 rounded-xl bg-secondary/60 border border-border">
             <span className="text-[10px] text-muted-foreground uppercase tracking-wider">DRS</span>
-            <span className={`text-base font-mono font-bold ${telemetry.drs ? "text-emerald-400" : "text-muted-foreground"}`}>
-              {telemetry.drs ? "OPEN" : "SHUT"}
+            <span className={`text-sm font-mono font-bold ${drsOpen ? "text-emerald-400" : "text-muted-foreground"}`}>
+              {drsOpen ? "OPEN" : "SHUT"}
+            </span>
+          </div>
+          <div className="flex flex-col items-center gap-1 px-2 py-3 rounded-xl bg-secondary/60 border border-border">
+            <span className="text-[10px] text-muted-foreground uppercase tracking-wider">G-Force</span>
+            <span className={`text-sm font-mono font-bold ${(state.gForce ?? 0) >= 3 ? "text-red-400" : (state.gForce ?? 0) >= 1.5 ? "text-amber-400" : "text-foreground"}`}>
+              {state.gForce != null ? `${state.gForce}G` : "—"}
             </span>
           </div>
         </div>
 
-        {/* Story */}
-        <div className="rounded-xl bg-[#2563EB]/5 border border-[#2563EB]/15 p-4">
-          <span className="text-xs font-mono text-[#2563EB] uppercase tracking-wider">{"What's"} {driverName} Doing?</span>
-          <p className="mt-2 text-sm text-foreground/90 leading-relaxed">{telemetry.story}</p>
-          
-          <button
-            onClick={() => setExpanded(!expanded)}
-            className="flex items-center gap-1 mt-3 text-xs text-[#2563EB] hover:text-[#2563EB]/80 transition-colors"
-          >
-            {expanded ? "Less detail" : "More detail"}
-            {expanded ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
-          </button>
+        {/* Track Map */}
+        <MiniTrackMap layout={circuit} activeCorner={state.activeCorner} driverPos={state.driverPos} />
 
-          {expanded && (
-            <p className="mt-3 pt-3 border-t border-[#2563EB]/10 text-sm text-foreground/80 leading-relaxed">
-              {telemetry.detail}
-            </p>
+        {/* Narrative */}
+        <div className="rounded-xl bg-[#2563EB]/5 border border-[#2563EB]/15 p-4">
+          <div className="flex items-center justify-between">
+            <span className="text-xs font-mono text-[#2563EB] uppercase tracking-wider">{"What's"} {driverName} Doing?</span>
+            <button
+              onClick={() => analyzeRef.current()}
+              disabled={!r || state.loading}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#2563EB] text-white text-xs font-medium disabled:opacity-40 disabled:cursor-not-allowed hover:bg-[#2563EB]/90 transition-colors"
+            >
+              {state.loading ? <Loader2 className="w-3 h-3 animate-spin" /> : <Activity className="w-3 h-3" />}
+              {state.loading ? "Analyzing..." : "Analyze"}
+            </button>
+          </div>
+
+          {state.error && (
+            <p className="mt-2 text-xs text-red-400">{state.error}</p>
+          )}
+
+          {!state.narrative && !state.loading && !state.error && (
+            <p className="mt-3 text-xs text-muted-foreground">Press Analyze to get AI commentary on the current telemetry.</p>
+          )}
+
+          {state.narrative && (
+            <>
+              <p className="mt-2 text-sm text-foreground/90 leading-relaxed">{typedNarrative}</p>
+
+              {state.detail && (
+                <>
+                  <button
+                    onClick={() => setExpanded(!expanded)}
+                    className="flex items-center gap-1 mt-3 text-xs text-[#2563EB] hover:text-[#2563EB]/80 transition-colors"
+                  >
+                    {expanded ? "Less detail" : "More detail"}
+                    {expanded ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+                  </button>
+
+                  {expanded && (
+                    <p className="mt-3 pt-3 border-t border-[#2563EB]/10 text-sm text-foreground/80 leading-relaxed">
+                      {typedDetail}
+                    </p>
+                  )}
+                </>
+              )}
+            </>
           )}
         </div>
       </div>
@@ -250,33 +1071,193 @@ function GaugeCell({ label, value, unit, percent, color }: { label: string; valu
 
 // --- Tyre Strategy Predictor ---
 
+const COMPOUND_COLORS: Record<string, string> = {
+  SOFT: "#FF4444",
+  MEDIUM: "#FFD700",
+  HARD: "#FFFFFF",
+  INTERMEDIATE: "#22C55E",
+  WET: "#2563EB",
+}
+
+let _lastTyreFetchTime = 0
+
+interface TyreStint {
+  stint_number: number
+  lap_start: number
+  lap_end: number
+  compound: string
+  tyre_age_at_start: number
+}
+
+interface TyreState {
+  stints: TyreStint[]
+  laps: { lap_number: number; date_start: string }[]
+  prediction: string
+  loading: boolean
+  error: string | null
+}
+
 function TyrePredictor({ driver }: { driver: DriverId }) {
   const driverName = driver === "albon" ? "Albon" : "Sainz"
+  const driverNum = driver === "albon" ? "23" : "55"
 
-  const stints = driver === "albon"
-    ? [
-        { compound: "HARD", color: "#FFFFFF", laps: "1-18", status: "completed" as const },
-        { compound: "MEDIUM", color: "#FFD700", laps: "19-?", status: "active" as const },
-        { compound: "SOFT", color: "#FF4444", laps: "Predicted", status: "predicted" as const },
-      ]
-    : [
-        { compound: "MEDIUM", color: "#FFD700", laps: "1-21", status: "completed" as const },
-        { compound: "HARD", color: "#FFFFFF", laps: "22-?", status: "active" as const },
-      ]
+  const [state, setState] = useState<TyreState>({ stints: [], laps: [], prediction: "", loading: false, error: null })
+  const prevDriverRef = useRef(driver)
 
-  const prediction = driver === "albon"
-    ? {
-        nextPit: "Lap 38-42",
-        confidence: 72,
-        strategy: "Two-stop",
-        explanation: "Based on current tyre degradation rates and Albon's pace on MEDIUMs, the AI predicts a pit window around Lap 38-42. A switch to SOFTs for a sprint finish would give him fresher rubber for the final 15 laps — potentially gaining 2 positions.",
+  // Reset on driver change
+  useEffect(() => {
+    if (prevDriverRef.current !== driver) {
+      prevDriverRef.current = driver
+      setState({ stints: [], laps: [], prediction: "", loading: false, error: null })
+      _lastTyreFetchTime = 0
+    }
+  }, [driver])
+
+  // Fetch stints from OpenF1
+  useEffect(() => {
+    let stale = false
+    let firstFetch = true
+
+    async function fetchStints() {
+      if (document.hidden) return
+      if (!firstFetch) {
+        const sinceLast = Date.now() - _lastTyreFetchTime
+        if (_lastTyreFetchTime > 0 && sinceLast < 60_000) return
       }
-    : {
-        nextPit: "No stop predicted",
-        confidence: 65,
-        strategy: "One-stop",
-        explanation: "Sainz's HARD tyres are holding up well. Current degradation suggests he can make it to the end on a one-stop strategy. However, if the gap to the car behind closes below 2 seconds, a late defensive stop for SOFTs could be triggered.",
+      firstFetch = false
+      _lastTyreFetchTime = Date.now()
+
+      const sessionKey = getSessionKey()
+      try {
+        const [stintData, lapData] = await Promise.all([
+          cachedFetch<any[]>(`https://api.openf1.org/v1/stints?session_key=${sessionKey}&driver_number=${driverNum}`).catch(() => []),
+          cachedFetch<any[]>(`https://api.openf1.org/v1/laps?session_key=${sessionKey}&driver_number=${driverNum}`).catch(() => []),
+        ])
+        if (!stale) {
+          setState((prev) => ({
+            ...prev,
+            stints: Array.isArray(stintData) ? stintData.map((s: any) => ({
+              stint_number: s.stint_number,
+              lap_start: s.lap_start,
+              lap_end: s.lap_end,
+              compound: (s.compound ?? "UNKNOWN").toUpperCase(),
+              tyre_age_at_start: s.tyre_age_at_start ?? 0,
+            })) : prev.stints,
+            laps: Array.isArray(lapData) ? lapData.map((l: any) => ({
+              lap_number: l.lap_number,
+              date_start: l.date_start,
+            })) : prev.laps,
+          }))
+        }
+      } catch {
+        // Non-critical — keep existing data
       }
+    }
+
+    let timer: ReturnType<typeof setTimeout>
+    function schedule() {
+      timer = setTimeout(async () => {
+        await fetchStints()
+        if (!stale) schedule()
+      }, 60_000)
+    }
+
+    fetchStints().then(() => { if (!stale) schedule() })
+
+    function onVisChange() {
+      if (!document.hidden && !stale) fetchStints()
+    }
+    document.addEventListener("visibilitychange", onVisChange)
+
+    return () => {
+      stale = true
+      if (timer) clearTimeout(timer)
+      document.removeEventListener("visibilitychange", onVisChange)
+    }
+  }, [driver, driverNum])
+
+  // Derive rolling current lap from sim clock + laps endpoint
+  const currentLap = (() => {
+    const t = simNow().getTime()
+    let best = getStartLap(30)
+    for (const l of state.laps) {
+      if (new Date(l.date_start).getTime() <= t) best = l.lap_number
+      else break
+    }
+    return best
+  })()
+  const totalLaps = 58
+
+  const classifiedStints = state.stints.map((s) => {
+    const isActive = s.lap_end >= currentLap || s.lap_end === 0 || s.stint_number === state.stints.length
+    const status: "active" | "completed" = (isActive && s.lap_start <= currentLap) ? "active" : "completed"
+    const tyreAge = status === "active" ? currentLap - s.lap_start + s.tyre_age_at_start : undefined
+    return { ...s, status, tyreAge }
+  })
+
+  // If the last stint extends beyond currentLap, mark it active
+  if (classifiedStints.length > 0) {
+    const last = classifiedStints[classifiedStints.length - 1]
+    if (last.status === "completed" && last.lap_end >= currentLap) {
+      last.status = "active"
+      last.tyreAge = currentLap - last.lap_start + last.tyre_age_at_start
+    }
+  }
+
+  // Predict button — same pattern as telemetry Analyze
+  const predictRef = useRef<() => void>(() => {})
+  predictRef.current = () => {
+    if (state.loading || state.stints.length === 0) return
+
+    setState((prev) => ({ ...prev, loading: true, error: null }))
+
+    const stintSummary = state.stints
+      .map((s) => `Stint ${s.stint_number}: ${s.compound}, laps ${s.lap_start}-${s.lap_end || "?"}, tyre age at start: ${s.tyre_age_at_start}`)
+      .join("\n")
+
+    const activeStint = classifiedStints.find((s) => s.status === "active")
+    const currentTyreAge = activeStint?.tyreAge ?? "unknown"
+
+    const prompt = `You are a Formula 1 tyre strategy analyst for Williams Racing. Here is the stint data for ${driverName} #${driverNum}:
+
+Current lap: ${currentLap}/${totalLaps} (${totalLaps - currentLap} laps remaining)
+
+Stint history:
+${stintSummary}
+
+Current tyre age: ${currentTyreAge} laps on ${activeStint?.compound ?? "UNKNOWN"}
+
+Provide a concise strategy analysis covering:
+1. Pit stop prediction — when is the next pit stop likely?
+2. Compound recommendation — what tyre should they switch to and why?
+3. Overall strategy assessment — is this a good strategy? Any risks?
+
+Do NOT call any tools. Write 2-3 short paragraphs.`
+
+    fetch("/api/airia", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ userInput: prompt, pipeline: "tyre" }),
+    })
+      .then((res) => res.json())
+      .then((data) => {
+        if (data.error) {
+          setState((prev) => ({ ...prev, loading: false, error: data.error }))
+          return
+        }
+        const raw: string = data.result ?? data.output ?? data.response ?? (typeof data === "string" ? data : "")
+        if (!raw) {
+          setState((prev) => ({ ...prev, loading: false, error: "Empty response from AI" }))
+          return
+        }
+        setState((prev) => ({ ...prev, prediction: raw.trim(), loading: false, error: null }))
+      })
+      .catch(() => {
+        setState((prev) => ({ ...prev, loading: false, error: "Failed to reach tyre strategy analysis" }))
+      })
+  }
+
+  const typedPrediction = useTypewriter(state.prediction)
 
   return (
     <div className="rounded-2xl border border-border bg-card overflow-hidden">
@@ -287,68 +1268,89 @@ function TyrePredictor({ driver }: { driver: DriverId }) {
           </div>
           <div>
             <h3 className="font-semibold text-foreground text-sm">Tyre Strategy</h3>
-            <p className="text-xs text-muted-foreground">Predict + Explain</p>
+            <p className="text-xs text-muted-foreground">Live Stints + AI Prediction</p>
           </div>
         </div>
         <div className="px-3 py-1 rounded-full bg-secondary border border-border">
-          <span className="text-xs font-mono text-muted-foreground">{prediction.strategy}</span>
+          <span className="text-xs font-mono text-muted-foreground">{state.stints.length} stint{state.stints.length !== 1 ? "s" : ""}</span>
         </div>
       </div>
 
       <div className="p-5">
         {/* Stint timeline */}
         <div className="flex flex-col gap-2 mb-4">
-          {stints.map((stint, i) => (
-            <div key={i} className="flex items-center gap-3 px-4 py-3 rounded-xl bg-secondary/60 border border-border">
-              <div
-                className="w-5 h-5 rounded-full border-2 flex-shrink-0"
-                style={{
-                  borderColor: stint.color,
-                  backgroundColor: stint.status === "predicted" ? "transparent" : `${stint.color}20`,
-                }}
-              >
-                {stint.status === "predicted" && (
-                  <div className="w-full h-full rounded-full border border-dashed" style={{ borderColor: stint.color }} />
-                )}
+          {classifiedStints.length === 0 && (
+            <div className="flex items-center justify-center py-6 text-sm text-muted-foreground">Loading stint data…</div>
+          )}
+          {classifiedStints.map((stint) => {
+            const color = COMPOUND_COLORS[stint.compound] ?? "#888888"
+            const lapRange = stint.lap_end && stint.status === "completed"
+              ? `${stint.lap_start}-${stint.lap_end}`
+              : `${stint.lap_start}-?`
+            const duration = stint.status === "completed" && stint.lap_end
+              ? stint.lap_end - stint.lap_start + 1
+              : currentLap - stint.lap_start + 1
+
+            return (
+              <div key={stint.stint_number} className="flex items-center gap-3 px-4 py-3 rounded-xl bg-secondary/60 border border-border">
+                {/* Pirelli-style tyre: dark rubber → compound band → dark hub */}
+                <div
+                  className="w-7 h-7 rounded-full flex items-center justify-center flex-shrink-0"
+                  style={{ background: "#1a1a1a", boxShadow: "0 0 0 1.5px #333" }}
+                >
+                  <div
+                    className="w-[18px] h-[18px] rounded-full flex items-center justify-center"
+                    style={{ background: color }}
+                  >
+                    <div className="w-2 h-2 rounded-full" style={{ background: "#111" }} />
+                  </div>
+                </div>
+                <div className="flex-1 min-w-0">
+                  <span className="text-sm font-medium text-foreground">{stint.compound}</span>
+                  {stint.tyreAge != null && (
+                    <span className="ml-2 text-xs text-muted-foreground font-mono">{stint.tyreAge}L age</span>
+                  )}
+                </div>
+                <span className="text-xs text-muted-foreground font-mono">{lapRange} ({duration}L)</span>
+                <span
+                  className={`text-[10px] uppercase tracking-wider font-mono px-2 py-0.5 rounded-full ${
+                    stint.status === "active"
+                      ? "bg-emerald-400/10 text-emerald-400 border border-emerald-400/20"
+                      : "bg-secondary text-muted-foreground border border-border"
+                  }`}
+                >
+                  {stint.status}
+                </span>
               </div>
-              <div className="flex-1 min-w-0">
-                <span className="text-sm font-medium text-foreground">{stint.compound}</span>
-              </div>
-              <span className="text-xs text-muted-foreground font-mono">{stint.laps}</span>
-              <span
-                className={`text-[10px] uppercase tracking-wider font-mono px-2 py-0.5 rounded-full ${
-                  stint.status === "active"
-                    ? "bg-emerald-400/10 text-emerald-400 border border-emerald-400/20"
-                    : stint.status === "completed"
-                      ? "bg-secondary text-muted-foreground border border-border"
-                      : "bg-[#2563EB]/10 text-[#2563EB] border border-[#2563EB]/20"
-                }`}
-              >
-                {stint.status}
-              </span>
-            </div>
-          ))}
+            )
+          })}
         </div>
 
         {/* Prediction box */}
         <div className="rounded-xl bg-[#2563EB]/5 border border-[#2563EB]/15 p-4">
-          <div className="flex items-center justify-between mb-2">
+          <div className="flex items-center justify-between">
             <span className="text-xs font-mono text-[#2563EB] uppercase tracking-wider">AI Prediction</span>
-            <div className="flex items-center gap-2">
-              <span className="text-xs text-muted-foreground">Confidence</span>
-              <div className="w-12 h-1.5 rounded-full bg-secondary overflow-hidden">
-                <div
-                  className="h-full rounded-full bg-[#2563EB] transition-all"
-                  style={{ width: `${prediction.confidence}%` }}
-                />
-              </div>
-              <span className="text-xs font-mono text-[#2563EB]">{prediction.confidence}%</span>
-            </div>
+            <button
+              onClick={() => predictRef.current()}
+              disabled={state.stints.length === 0 || state.loading}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#2563EB] text-white text-xs font-medium disabled:opacity-40 disabled:cursor-not-allowed hover:bg-[#2563EB]/90 transition-colors"
+            >
+              {state.loading ? <Loader2 className="w-3 h-3 animate-spin" /> : <CircleDot className="w-3 h-3" />}
+              {state.loading ? "Predicting..." : "Predict"}
+            </button>
           </div>
-          <div className="flex items-center gap-2 mb-3">
-            <span className="text-lg font-mono font-bold text-foreground">{prediction.nextPit}</span>
-          </div>
-          <p className="text-sm text-foreground/90 leading-relaxed">{prediction.explanation}</p>
+
+          {state.error && (
+            <p className="mt-2 text-xs text-red-400">{state.error}</p>
+          )}
+
+          {!state.prediction && !state.loading && !state.error && (
+            <p className="mt-3 text-xs text-muted-foreground">Press Predict to get AI tyre strategy analysis.</p>
+          )}
+
+          {state.prediction && (
+            <p className="mt-3 text-sm text-foreground/90 leading-relaxed whitespace-pre-line">{typedPrediction}</p>
+          )}
         </div>
       </div>
     </div>
@@ -403,36 +1405,35 @@ export function HomeDashboard({ onBack }: HomeDashboardProps) {
         <div className="px-5 pb-3">
           <DriverSelector selected={driver} onChange={setDriver} />
         </div>
+        {/* Tab switcher */}
+        <div className="px-5 pb-3">
+          <div className="flex gap-1 p-1 rounded-xl bg-secondary/60 border border-border">
+            {tabs.map((tab) => {
+              const Icon = tab.icon
+              return (
+                <button
+                  key={tab.id}
+                  onClick={() => setActiveTab(tab.id)}
+                  className={`flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg text-xs font-medium transition-all ${
+                    activeTab === tab.id
+                      ? "bg-card text-foreground border border-border shadow-sm"
+                      : "text-muted-foreground hover:text-foreground"
+                  }`}
+                >
+                  <Icon className="w-3.5 h-3.5" />
+                  <span>{tab.label}</span>
+                </button>
+              )
+            })}
+          </div>
+        </div>
       </header>
 
-      {/* Tab switcher */}
-      <div className="px-5 pt-4">
-        <div className="flex gap-1 p-1 rounded-xl bg-secondary/60 border border-border">
-          {tabs.map((tab) => {
-            const Icon = tab.icon
-            return (
-              <button
-                key={tab.id}
-                onClick={() => setActiveTab(tab.id)}
-                className={`flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg text-xs font-medium transition-all ${
-                  activeTab === tab.id
-                    ? "bg-card text-foreground border border-border shadow-sm"
-                    : "text-muted-foreground hover:text-foreground"
-                }`}
-              >
-                <Icon className="w-3.5 h-3.5" />
-                <span>{tab.label}</span>
-              </button>
-            )
-          })}
-        </div>
-      </div>
-
-      {/* Content */}
+      {/* Content — keep all tabs mounted to preserve state across switches */}
       <main className="flex-1 px-5 py-4 pb-8">
-        {activeTab === "tension" && <TensionTracker driver={driver} />}
-        {activeTab === "telemetry" && <TelemetryStoryteller driver={driver} />}
-        {activeTab === "tyre" && <TyrePredictor driver={driver} />}
+        <div className={activeTab === "tension" ? "" : "hidden"}><TensionTracker driver={driver} /></div>
+        <div className={activeTab === "telemetry" ? "" : "hidden"}><TelemetryStoryteller driver={driver} /></div>
+        <div className={activeTab === "tyre" ? "" : "hidden"}><TyrePredictor driver={driver} /></div>
       </main>
     </div>
   )
