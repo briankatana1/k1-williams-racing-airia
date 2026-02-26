@@ -1,14 +1,15 @@
 "use client"
 
 import { useState, useEffect, useRef } from "react"
-import { ArrowLeft, Zap, Radio, CloudRain, MapPin } from "lucide-react"
+import { ArrowLeft, Zap, Radio, CloudRain, MapPin, Loader2 } from "lucide-react"
 import Image from "next/image"
 import { DriverSelector, type DriverId } from "./driver-selector"
 import { fetchPitData, type PitData } from "@/lib/openf1"
-import { getMeetingKey, getSessionKey, getStartLap, getSessionsUrl, cachedFetch, sessionTypeToLabel } from "@/lib/simulation"
+import { getMeetingKey, getSessionKey, getStartLap, getSessionsUrl, cachedFetch, sessionTypeToLabel, now as simNow } from "@/lib/simulation"
 import { TeamRadioCard } from "./team-radio"
 import { LivePositionCard } from "./live-position"
 import { AskAiFab } from "./ask-ai"
+import { usePurpleSectorToasts } from "@/hooks/use-purple-sector-toasts"
 
 interface VenueDashboardProps {
   onBack: () => void
@@ -24,39 +25,49 @@ const TYRE_COLORS: Record<string, string> = {
   WET: "#3B82F6",
 }
 
+// Typewriter hook — reveals text word-by-word
+function useTypewriter(text: string, speed = 30): string {
+  const [displayed, setDisplayed] = useState("")
+  const prevTextRef = useRef("")
+
+  useEffect(() => {
+    if (!text || text === prevTextRef.current) return
+    prevTextRef.current = text
+    const words = text.split(/(\s+)/)
+    let i = 0
+    setDisplayed("")
+    const timer = setInterval(() => {
+      i++
+      setDisplayed(words.slice(0, i).join(""))
+      if (i >= words.length) clearInterval(timer)
+    }, speed)
+    return () => clearInterval(timer)
+  }, [text, speed])
+
+  return text ? displayed : ""
+}
+
 // Cache the in-flight promise so strict-mode remount reuses it (1 call, not 2)
-const _fetchCache = new Map<string, Promise<[PromiseSettledResult<PitData>, PromiseSettledResult<any>]>>()
+const _fetchCache = new Map<string, Promise<PitData>>()
 
-function doFetch(driver: DriverId) {
-  const name = driver === "albon" ? "Albon" : "Sainz"
+function doFetch(driver: DriverId): Promise<PitData> {
   const num = driver === "albon" ? 23 : 55
-  const meetingKey = getMeetingKey()
-  const sessionKey = getSessionKey()
-  const currentLap = getStartLap(30)
-  const simTime = process.env.NEXT_PUBLIC_SIM_TIME ?? new Date().toISOString()
-
-  return Promise.allSettled([
-    fetchPitData(num),
-    fetch("/api/airia", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        userInput: `Analyze pit strategy for driver ${name} #${num}. Meeting key: ${meetingKey}, Session key: ${sessionKey}, current lap: ${currentLap}, current time: ${simTime}.`,
-        pipeline: "pit",
-      }),
-    }).then(r => r.json()),
-  ]) as Promise<[PromiseSettledResult<PitData>, PromiseSettledResult<any>]>
+  return fetchPitData(num)
 }
 
 function PitStrategyCard({ driver }: { driver: DriverId }) {
   const [pitData, setPitData] = useState<PitData | null>(null)
   const [strategy, setStrategy] = useState<string | null>(null)
+  const [aiLoading, setAiLoading] = useState(false)
+  const [aiError, setAiError] = useState<string | null>(null)
   const [phase, setPhase] = useState<"loading" | "leaving" | "done">("loading")
   const [pitTime, setPitTime] = useState("0.00")
   const pitTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   const driverName = driver === "albon" ? "Albon" : "Sainz"
   const driverNum = driver === "albon" ? 23 : 55
+
+  const typedStrategy = useTypewriter(strategy ?? "")
 
   // Animate pit time counting up from 0 to actual duration
   const animatePitTime = (target: number) => {
@@ -72,6 +83,48 @@ function PitStrategyCard({ driver }: { driver: DriverId }) {
     }, 30)
   }
 
+  // AI analysis — triggered manually via Analyze button
+  const analyzeRef = useRef<() => void>(() => {})
+  analyzeRef.current = () => {
+    if (aiLoading) return
+
+    setAiLoading(true)
+    setAiError(null)
+
+    const meetingKey = getMeetingKey()
+    const sessionKey = getSessionKey()
+    const currentLap = getStartLap(30)
+    const simTime = process.env.NEXT_PUBLIC_SIM_TIME ?? new Date().toISOString()
+
+    const pitContext = pitData
+      ? `Last pit: ${pitData.lastPitLap != null ? `Lap ${pitData.lastPitLap}` : "None"}, Tyre: ${pitData.compound} (${pitData.tyreAge} laps old), Position: ${pitData.position != null ? `P${pitData.position}` : "N/A"}, Gap to leader: ${pitData.gapToLeader}, Weather: ${pitData.weather}`
+      : ""
+
+    fetch("/api/airia", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        userInput: `Analyze pit strategy for driver ${driverName} #${driverNum}. Meeting key: ${meetingKey}, Session key: ${sessionKey}, current lap: ${currentLap}, current time: ${simTime}. ${pitContext}`,
+        pipeline: "pit",
+      }),
+    })
+      .then((r) => r.json())
+      .then((data) => {
+        if (data.error) {
+          setAiError(data.error)
+          setAiLoading(false)
+          return
+        }
+        const text = data.result ?? data.output ?? data.response ?? (typeof data === "string" ? data : null)
+        setStrategy(text ?? "Strategy analysis unavailable.")
+        setAiLoading(false)
+      })
+      .catch(() => {
+        setAiError("Failed to reach strategy analysis")
+        setAiLoading(false)
+      })
+  }
+
   useEffect(() => {
     let stale = false
     const startTime = Date.now()
@@ -80,6 +133,8 @@ function PitStrategyCard({ driver }: { driver: DriverId }) {
     setPhase("loading")
     setPitData(null)
     setStrategy(null)
+    setAiLoading(false)
+    setAiError(null)
     setPitTime("0.00")
 
     // Reuse in-flight promise if one already exists for this driver
@@ -87,7 +142,10 @@ function PitStrategyCard({ driver }: { driver: DriverId }) {
       _fetchCache.set(driver, doFetch(driver))
     }
 
-    _fetchCache.get(driver)!.then(async ([pitResult, airiaResult]) => {
+    _fetchCache.get(driver)!.then(async (result) => {
+      // Clear cache after resolving so next mount fetches fresh data
+      setTimeout(() => _fetchCache.delete(driver), 2_000)
+
       if (stale) return
 
       // Ensure pit stop animation plays for at least MIN_PIT_MS
@@ -97,20 +155,10 @@ function PitStrategyCard({ driver }: { driver: DriverId }) {
       }
       if (stale) return
 
-      if (pitResult.status === "fulfilled") {
-        setPitData(pitResult.value)
-        // Animate pit time count-up to actual duration
-        const dur = pitResult.value.pitDuration
-        if (dur != null) animatePitTime(dur)
-      }
-
-      if (airiaResult.status === "fulfilled" && !airiaResult.value.error) {
-        const data = airiaResult.value
-        const text = data.result ?? data.output ?? data.response ?? (typeof data === "string" ? data : null)
-        setStrategy(text ?? "Strategy analysis unavailable.")
-      } else {
-        setStrategy("AI analysis is temporarily unavailable.")
-      }
+      setPitData(result)
+      // Animate pit time count-up to actual duration
+      const dur = result.pitDuration
+      if (dur != null) animatePitTime(dur)
 
       // Let the count-up animation finish (800ms), then car drives out
       await new Promise(r => setTimeout(r, 850))
@@ -120,6 +168,10 @@ function PitStrategyCard({ driver }: { driver: DriverId }) {
       setTimeout(() => {
         if (!stale) setPhase("done")
       }, 900)
+    }).catch(() => {
+      // Clear failed cache entry so retries work
+      _fetchCache.delete(driver)
+      if (!stale) setPhase("done")
     })
 
     return () => {
@@ -127,6 +179,19 @@ function PitStrategyCard({ driver }: { driver: DriverId }) {
       if (pitTimerRef.current) clearInterval(pitTimerRef.current)
     }
   }, [driver])
+
+  // Silent background refresh every 30s once animation is done
+  useEffect(() => {
+    if (phase !== "done") return
+    let stale = false
+    const timer = setInterval(() => {
+      if (stale) return
+      fetchPitData(driverNum).then((result) => {
+        if (!stale) setPitData(result)
+      }).catch(() => {})
+    }, 30_000)
+    return () => { stale = true; clearInterval(timer) }
+  }, [phase, driverNum])
 
   const tyreColor = pitData ? (TYRE_COLORS[pitData.compound] ?? "#888888") : "#888888"
 
@@ -247,7 +312,7 @@ function PitStrategyCard({ driver }: { driver: DriverId }) {
               )}
             </div>
             <span className="text-xs text-muted-foreground/60 font-mono">
-              {phase === "leaving" ? `Strategy ready for #${driverNum}` : `Analyzing #${driverNum} ${driverName}`}
+              {phase === "leaving" ? `Data ready for #${driverNum}` : `Fetching #${driverNum} ${driverName}`}
             </span>
           </div>
         ) : (
@@ -282,10 +347,29 @@ function PitStrategyCard({ driver }: { driver: DriverId }) {
 
             {/* AI Strategy Explanation */}
             <div className="rounded-xl bg-[#2563EB]/5 border border-[#2563EB]/15 p-4">
-              <div className="flex items-center gap-2 mb-2">
+              <div className="flex items-center justify-between mb-2">
                 <span className="text-xs font-mono text-[#2563EB] uppercase tracking-wider">AI Analysis</span>
+                <button
+                  onClick={() => analyzeRef.current()}
+                  disabled={aiLoading}
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#2563EB] text-white text-xs font-medium disabled:opacity-40 disabled:cursor-not-allowed hover:bg-[#2563EB]/90 transition-colors"
+                >
+                  {aiLoading ? <Loader2 className="w-3 h-3 animate-spin" /> : <Zap className="w-3 h-3" />}
+                  {aiLoading ? "Analyzing..." : "Analyze"}
+                </button>
               </div>
-              <p className="text-sm text-foreground/90 leading-relaxed">{strategy}</p>
+
+              {aiError && (
+                <p className="mt-2 text-xs text-red-400">{aiError}</p>
+              )}
+
+              {!strategy && !aiLoading && !aiError && (
+                <p className="text-xs text-muted-foreground">Press Analyze to get AI pit strategy commentary.</p>
+              )}
+
+              {strategy && (
+                <p className="text-sm text-foreground/90 leading-relaxed">{typedStrategy}</p>
+              )}
             </div>
           </>
         )}
@@ -318,15 +402,74 @@ function useSessionLabel(): string {
   return label
 }
 
+function useCurrentLap(driverNum: number): number {
+  const [currentLap, setCurrentLap] = useState(getStartLap(30))
+  useEffect(() => {
+    let stale = false
+    function poll() {
+      const sk = getSessionKey()
+      const simTime = simNow()
+      const simIso = simTime.toISOString()
+      cachedFetch<{ lap_number: number; date_start: string }[]>(
+        `https://api.openf1.org/v1/laps?session_key=${sk}&driver_number=${driverNum}&date_start%3C=${encodeURIComponent(simIso)}`
+      )
+        .then((laps) => {
+          if (stale || !Array.isArray(laps)) return
+          const t = simTime.getTime()
+          let lap = getStartLap(30)
+          for (const l of laps) {
+            if (new Date(l.date_start).getTime() <= t) lap = l.lap_number
+            else break
+          }
+          setCurrentLap(lap)
+        })
+        .catch(() => {})
+    }
+    poll()
+    const timer = setInterval(poll, 30_000)
+    return () => { stale = true; clearInterval(timer) }
+  }, [driverNum])
+  return currentLap
+}
+
+function usePosition(driverNum: number): number | null {
+  const [position, setPosition] = useState<number | null>(null)
+  useEffect(() => {
+    setPosition(null)
+    let stale = false
+    function poll() {
+      const sk = getSessionKey()
+      const simIso = simNow().toISOString()
+      cachedFetch<{ position: number; date: string }[]>(
+        `https://api.openf1.org/v1/position?session_key=${sk}&driver_number=${driverNum}&date%3C=${encodeURIComponent(simIso)}`
+      )
+        .then((positions) => {
+          if (stale || !Array.isArray(positions) || positions.length === 0) return
+          setPosition(positions[positions.length - 1].position)
+        })
+        .catch(() => {})
+    }
+    poll()
+    const timer = setInterval(poll, 30_000)
+    return () => { stale = true; clearInterval(timer) }
+  }, [driverNum])
+  return position
+}
+
 export function VenueDashboard({ onBack }: VenueDashboardProps) {
   const [driver, setDriver] = useState<DriverId>("albon")
-  const [activeTab, setActiveTab] = useState<"pit" | "radio" | "track">("pit")
+  const [activeTab, setActiveTab] = useState<"track" | "pit" | "radio">("track")
   const sessionLabel = useSessionLabel()
+  const driverNum = driver === "albon" ? 23 : 55
+  const currentLap = useCurrentLap(driverNum)
+  const position = usePosition(driverNum)
+
+  usePurpleSectorToasts()
 
   return (
     <div className="h-full min-h-dvh flex flex-col bg-background">
       {/* Header */}
-      <header className="sticky top-0 z-20 bg-background/80 backdrop-blur-xl border-b border-border">
+      <header className="sticky top-0 z-20 bg-background border-b border-border">
         <div className="flex items-center gap-3 px-5 pt-12 pb-3">
           <button
             onClick={onBack}
@@ -336,14 +479,26 @@ export function VenueDashboard({ onBack }: VenueDashboardProps) {
             <ArrowLeft className="w-5 h-5 text-muted-foreground" />
           </button>
           <Image src="/Williams_F1_logo_2026.png" alt="Williams Racing" width={112} height={40} className="w-28 h-auto" />
-          <div className="ml-auto flex items-center gap-3">
-            <span className="px-2.5 py-0.5 rounded-full bg-[#2563EB]/10 text-[#2563EB] text-[10px] font-mono uppercase tracking-wider border border-[#2563EB]/20">
-              {sessionLabel}
-            </span>
-            <span className="flex items-center gap-1.5">
-              <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-              <span className="text-[11px] text-emerald-400 font-mono uppercase">At Circuit</span>
-            </span>
+          <div className="ml-auto flex flex-col items-end gap-1.5">
+            <div className="flex items-center gap-2">
+              <span className="px-2 py-0.5 rounded-full bg-[#7C3AED]/10 text-[#7C3AED] text-[10px] font-mono font-bold uppercase tracking-wider border border-[#7C3AED]/20">
+                LAP {currentLap}
+              </span>
+              <span className="px-2.5 py-0.5 rounded-full bg-[#2563EB]/10 text-[#2563EB] text-[10px] font-mono uppercase tracking-wider border border-[#2563EB]/20">
+                {sessionLabel}
+              </span>
+            </div>
+            <div className="flex items-center gap-2">
+              {position != null && (
+                <span className="px-2.5 py-0.5 rounded-full bg-emerald-400/10 text-emerald-400 text-[10px] font-mono font-bold uppercase tracking-wider border border-emerald-400/20">
+                  POSITION {position}
+                </span>
+              )}
+              <span className="flex items-center gap-1.5">
+                <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+                <span className="text-[11px] text-emerald-400 font-mono uppercase">At Circuit</span>
+              </span>
+            </div>
           </div>
         </div>
         <div className="px-5 pb-3">
@@ -355,9 +510,9 @@ export function VenueDashboard({ onBack }: VenueDashboardProps) {
       <div className="px-5 pt-4">
         <div className="flex gap-1 p-1 rounded-xl bg-secondary/60 border border-border">
           {([
+            { id: "track" as const, label: "Track", Icon: MapPin },
             { id: "pit" as const, label: "Pit Strategy", Icon: Zap },
             { id: "radio" as const, label: "Team Radio", Icon: Radio },
-            { id: "track" as const, label: "Track", Icon: MapPin },
           ]).map(({ id, label, Icon }) => (
             <button
               key={id}

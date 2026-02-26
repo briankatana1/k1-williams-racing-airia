@@ -47,8 +47,6 @@ export function findNearestCorner(pos: DriverPosition, corners: CircuitCorner[])
     const d = dx * dx + dy * dy
     if (d < bestDist) { bestDist = d; best = c }
   }
-  // Only highlight if driver is within ~200m of the corner (squared distance threshold)
-  if (bestDist > 200 * 200) return null
   return best.number
 }
 
@@ -127,7 +125,12 @@ export function MiniTrackMap({ layout, activeCorner, driverPos }: { layout: Circ
           {(layout.corners ?? []).map((c) => {
             const cx = c.trackPosition.x - minX + padding
             const cy = c.trackPosition.y - minY + padding
-            const isActive = activeCorner === c.number
+            // Only highlight corner on map when driver is actually near it
+            const isActive = activeCorner === c.number && (
+              !driverPos || (
+                (driverPos.x - c.trackPosition.x) ** 2 + (driverPos.y - c.trackPosition.y) ** 2 <= 200 * 200
+              )
+            )
             return (
               <g key={c.number}>
                 {isActive && (

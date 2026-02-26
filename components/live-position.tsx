@@ -16,11 +16,33 @@ export function LivePositionCard({ driver }: { driver: DriverId }) {
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null)
   const [loading, setLoading] = useState(true)
   const prevDriverRef = useRef(driver)
+  const prevCornerRef = useRef<number | null>(null)
+
+  // Smooth corner transitions: prevent jumps to non-sequential corners on parallel track sections
+  function smoothCorner(nearest: number | null, corners: { number: number; trackPosition: { x: number; y: number } }[], pos: DriverPosition): number | null {
+    if (nearest == null) return nearest
+    const prev = prevCornerRef.current
+    if (prev == null) { prevCornerRef.current = nearest; return nearest }
+    const total = corners.length
+    if (total === 0) return nearest
+    const diff = Math.abs(nearest - prev)
+    const wrappedDiff = Math.min(diff, total - diff)
+    if (wrappedDiff <= 4) { prevCornerRef.current = nearest; return nearest }
+    // Large jump — only accept if driver is very close to the new corner
+    const corner = corners.find(c => c.number === nearest)
+    if (corner) {
+      const dx = pos.x - corner.trackPosition.x
+      const dy = pos.y - corner.trackPosition.y
+      if (dx * dx + dy * dy <= 100 * 100) { prevCornerRef.current = nearest; return nearest }
+    }
+    return prev
+  }
 
   // Reset on driver change
   useEffect(() => {
     if (prevDriverRef.current !== driver) {
       prevDriverRef.current = driver
+      prevCornerRef.current = null
       setDriverPos(null)
       setActiveCorner(null)
       setLastUpdated(null)
@@ -62,7 +84,7 @@ export function LivePositionCard({ driver }: { driver: DriverId }) {
             const pos: DriverPosition = { x: latest.x, y: latest.y }
             setDriverPos(pos)
             const nearest = circuit ? findNearestCorner(pos, circuit.corners ?? []) : null
-            setActiveCorner(nearest)
+            setActiveCorner(smoothCorner(nearest, circuit?.corners ?? [], pos))
             setLastUpdated(new Date())
           }
         }
@@ -81,7 +103,8 @@ export function LivePositionCard({ driver }: { driver: DriverId }) {
   // Update activeCorner when circuit loads after position
   useEffect(() => {
     if (driverPos && circuit) {
-      setActiveCorner(findNearestCorner(driverPos, circuit.corners ?? []))
+      const nearest = findNearestCorner(driverPos, circuit.corners ?? [])
+      setActiveCorner(smoothCorner(nearest, circuit.corners ?? [], driverPos))
     }
   }, [circuit, driverPos])
 
@@ -118,15 +141,17 @@ export function LivePositionCard({ driver }: { driver: DriverId }) {
             {/* Stats row */}
             <div className="grid grid-cols-3 gap-3">
               <div className="flex flex-col items-center gap-1 px-3 py-3 rounded-xl bg-secondary/60 border border-border">
-                <span className="text-[10px] text-muted-foreground uppercase tracking-wider">Corner</span>
+                <span className="text-[10px] text-muted-foreground uppercase tracking-wider">Sector</span>
                 <span className="text-base font-mono font-bold text-foreground">
-                  {activeCorner != null ? `T${activeCorner}` : "—"}
+                  {activeCorner != null && circuit?.corners?.length
+                    ? `S${Math.min(3, Math.ceil(activeCorner / (circuit.corners.length / 3)))}`
+                    : "—"}
                 </span>
               </div>
               <div className="flex flex-col items-center gap-1 px-3 py-3 rounded-xl bg-secondary/60 border border-border">
-                <span className="text-[10px] text-muted-foreground uppercase tracking-wider">Position</span>
-                <span className="text-[11px] font-mono text-foreground">
-                  {driverPos ? `${Math.round(driverPos.x)}, ${Math.round(driverPos.y)}` : "—"}
+                <span className="text-[10px] text-muted-foreground uppercase tracking-wider">Turn</span>
+                <span className="text-base font-mono font-bold text-foreground">
+                  {activeCorner != null ? `T${activeCorner}` : "—"}
                 </span>
               </div>
               <div className="flex flex-col items-center gap-1 px-3 py-3 rounded-xl bg-secondary/60 border border-border">

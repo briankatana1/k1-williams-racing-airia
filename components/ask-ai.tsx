@@ -3,6 +3,7 @@
 import { useState, useEffect, useRef } from "react"
 import { MessageCircle, Send, Mic, X } from "lucide-react"
 import { getMeetingKey, getSessionKey, getStartLap } from "@/lib/simulation"
+import { usePhoneFrame } from "@/lib/phone-frame-context"
 import {
   Drawer,
   DrawerTrigger,
@@ -175,8 +176,9 @@ function AskAiPanel() {
 // --- Floating Action Button + Drawer ---
 
 export function AskAiFab() {
+  const phoneFrame = usePhoneFrame()
   return (
-    <Drawer>
+    <Drawer container={phoneFrame}>
       <div className="sticky bottom-0 z-30 pointer-events-none">
         <div className="flex justify-end px-5 pb-6 pt-2">
           <DrawerTrigger asChild>

@@ -16,21 +16,33 @@ async function f1(path: string): Promise<any[]> {
   try {
     const data = await cachedFetch<any>(`${BASE}${path}`)
     return Array.isArray(data) ? data : []
-  } catch {
+  } catch (err) {
+    console.warn(`[openf1] ${path} failed:`, err)
     return []
   }
 }
 
 export async function fetchPitData(driverNumber: number): Promise<PitData> {
   const sk = getSessionKey()
-  const currentLap = getStartLap(1)
   const simTime = now().toISOString()
 
-  // 4 sequential calls — use API-level filtering to keep responses small
-  const stints = await f1(`/stints?driver_number=${driverNumber}&session_key=${sk}&lap_start<=${currentLap}`)
-  const pits = await f1(`/pit?driver_number=${driverNumber}&session_key=${sk}&lap_number<=${currentLap}`)
-  const positions = await f1(`/position?driver_number=${driverNumber}&session_key=${sk}&date<=${simTime}`)
-  const weather = await f1(`/weather?session_key=${sk}&date<=${simTime}`)
+  const simEncoded = encodeURIComponent(simTime)
+
+  // 1) Fetch laps first to derive dynamic currentLap
+  const laps = await f1(`/laps?driver_number=${driverNumber}&session_key=${sk}&date_start%3C=${simEncoded}`)
+  let currentLap = getStartLap(1)
+  const simMs = new Date(simTime).getTime()
+  for (const l of laps) {
+    if (new Date(l.date_start).getTime() <= simMs) currentLap = l.lap_number
+    else break
+  }
+
+  // 2) Fetch remaining data sequentially (OpenF1 rate-limits concurrent requests)
+  const stints = await f1(`/stints?driver_number=${driverNumber}&session_key=${sk}&lap_start%3C=${currentLap}`)
+  const pits = await f1(`/pit?driver_number=${driverNumber}&session_key=${sk}&lap_number%3C=${currentLap}`)
+  const positions = await f1(`/position?driver_number=${driverNumber}&session_key=${sk}&date%3C=${simEncoded}`)
+  const intervals = await f1(`/intervals?driver_number=${driverNumber}&session_key=${sk}&date%3C=${simEncoded}`)
+  const weather = await f1(`/weather?session_key=${sk}&date%3C=${simEncoded}`)
 
   // Latest stint at or before current lap
   const latestStint = stints.length > 0 ? stints[stints.length - 1] : null
@@ -48,7 +60,12 @@ export async function fetchPitData(driverNumber: number): Promise<PitData> {
   // Latest position at or before sim time
   const latestPosition = positions.length > 0 ? positions[positions.length - 1] : null
   const position: number | null = latestPosition?.position ?? null
-  const gapToLeader = "N/A"
+
+  // Gap to leader from intervals API
+  const latestInterval = intervals.length > 0 ? intervals[intervals.length - 1] : null
+  const gapToLeader = latestInterval?.gap_to_leader != null
+    ? `+${Number(latestInterval.gap_to_leader).toFixed(3)}s`
+    : "N/A"
 
   // Weather at or before sim time
   const latestWeather = weather.length > 0 ? weather[weather.length - 1] : null

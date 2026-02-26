@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useRef } from "react"
 import { Radio, Play, Pause, Loader2, FileText } from "lucide-react"
-import { getMeetingKey, getSessionKey, cachedFetch, sessionTypeToLabel } from "@/lib/simulation"
+import { getMeetingKey, getSessionKey, cachedFetch, sessionTypeToLabel, now as simNow } from "@/lib/simulation"
 import type { DriverId } from "./driver-selector"
 
 interface RadioClip {
@@ -138,9 +138,12 @@ export function TeamRadioCard({ driver }: { driver: DriverId }) {
     const sessionsUrl = `https://api.openf1.org/v1/sessions?meeting_key=${mk}`
 
     function fetchClips(isInitial: boolean) {
+      const simIso = simNow().toISOString()
+      const timeFilteredRadioUrl = `${radioUrl}&date%3C=${encodeURIComponent(simIso)}`
+      const timeFilteredLapsUrl = `${lapsUrl}&date_start%3C=${encodeURIComponent(simIso)}`
       Promise.all([
-        cachedFetch<RadioClip[]>(radioUrl).catch(() => [] as RadioClip[]),
-        cachedFetch<LapEntry[]>(lapsUrl).catch(() => [] as LapEntry[]),
+        cachedFetch<RadioClip[]>(timeFilteredRadioUrl).catch(() => [] as RadioClip[]),
+        cachedFetch<LapEntry[]>(timeFilteredLapsUrl).catch(() => [] as LapEntry[]),
         cachedFetch<SessionInfo[]>(sessionsUrl).catch(() => [] as SessionInfo[]),
       ]).then(([radioData, lapData, sessionsData]) => {
         if (stale) return

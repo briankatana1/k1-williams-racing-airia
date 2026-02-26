@@ -7,6 +7,7 @@ import { DriverSelector, type DriverId } from "./driver-selector"
 import { getStartLap, getSessionKey, getSessionsUrl, cachedFetch, sessionTypeToLabel, now as simNow } from "@/lib/simulation"
 import { AskAiFab } from "./ask-ai"
 import { fetchCircuitLayout, findNearestCorner, MiniTrackMap, type CircuitLayout, type DriverPosition } from "./track-map"
+import { usePurpleSectorToasts } from "@/hooks/use-purple-sector-toasts"
 
 // Typewriter hook — reveals text word-by-word
 function useTypewriter(text: string, speed = 30): string {
@@ -51,6 +52,7 @@ interface LiveData {
   carData: any[]
   location: any[]
   currentLap: number
+  position: number | null
 }
 
 interface LiveDataProps {
@@ -67,6 +69,7 @@ const LIVE_DATA_DEFAULTS: LiveData = {
   carData: [],
   location: [],
   currentLap: getStartLap(30),
+  position: null,
 }
 
 let _lastLiveDataFetchTime = 0
@@ -491,7 +494,7 @@ function TensionTracker({ driver, driverName, driverNum, liveData }: LiveDataPro
 Here is the latest interval data (already fetched, do NOT call the Get intervals tool):
 ${intervalSnippet}
 
-Based on this data, provide brief bullet-point commentary on gap closures, DRS proximity, and overtake opportunities.`
+Based on this data, provide 3-5 bullet-point commentary lines. Each bullet must be a complete sentence (15+ words) analyzing one of: gap trends, DRS proximity, overtake chances, defensive pressure, or strategy implications. Do NOT return single keywords or short phrases — write full analytical sentences.`
 
     fetch("/api/airia", {
       method: "POST",
@@ -511,7 +514,10 @@ Based on this data, provide brief bullet-point commentary on gap closures, DRS p
           return
         }
 
-        const lines = raw.split("\n").map((l: string) => l.replace(/^[\s\-\*•\d.]+/, "").trim()).filter((l: string) => l.length > 10)
+        // Strip leading bullet markers but keep the sentence content
+        const lines = raw.split("\n")
+          .map((l: string) => l.replace(/^[\s\-\*•]+/, "").replace(/^\d+[.)]\s*/, "").trim())
+          .filter((l: string) => l.length > 5)
         const bullets: CommentaryBullet[] = lines.map((text: string) => ({
           id: `b-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
           text,
@@ -585,11 +591,32 @@ function TelemetryStoryteller({ driver, driverName, driverNum, liveData }: LiveD
   })
   const [circuit, setCircuit] = useState<CircuitLayout | null>(null)
   const prevDriverRef = useRef(driver)
+  const prevCornerRef = useRef<number | null>(null)
+
+  // Smooth corner transitions: prevent jumps to non-sequential corners on parallel track sections
+  function smoothCorner(nearest: number | null, corners: { number: number; trackPosition: { x: number; y: number } }[], pos: DriverPosition): number | null {
+    if (nearest == null) return nearest
+    const prev = prevCornerRef.current
+    if (prev == null) { prevCornerRef.current = nearest; return nearest }
+    const total = corners.length
+    if (total === 0) return nearest
+    const diff = Math.abs(nearest - prev)
+    const wrappedDiff = Math.min(diff, total - diff)
+    if (wrappedDiff <= 4) { prevCornerRef.current = nearest; return nearest }
+    const corner = corners.find(c => c.number === nearest)
+    if (corner) {
+      const dx = pos.x - corner.trackPosition.x
+      const dy = pos.y - corner.trackPosition.y
+      if (dx * dx + dy * dy <= 100 * 100) { prevCornerRef.current = nearest; return nearest }
+    }
+    return prev
+  }
 
   // Reset on driver change
   useEffect(() => {
     if (prevDriverRef.current !== driver) {
       prevDriverRef.current = driver
+      prevCornerRef.current = null
       setState({ reading: null, gForce: null, driverPos: null, narrative: "", detail: "", activeCorner: null, loading: false, error: null })
       setExpanded(false)
     }
@@ -649,7 +676,8 @@ function TelemetryStoryteller({ driver, driverName, driverNum, liveData }: LiveD
     }
 
     if (reading) {
-      const activeCorner = driverPos && circuit ? findNearestCorner(driverPos, circuit.corners ?? []) : null
+      const nearest = driverPos && circuit ? findNearestCorner(driverPos, circuit.corners ?? []) : null
+      const activeCorner = driverPos ? smoothCorner(nearest, circuit?.corners ?? [], driverPos) : nearest
       setState((prev) => ({ ...prev, reading, gForce, driverPos, activeCorner }))
     }
   }, [liveData.carData, liveData.location, circuit])
@@ -1037,12 +1065,14 @@ type TabId = "tension" | "telemetry" | "tyre"
 
 export function HomeDashboard({ onBack }: HomeDashboardProps) {
   const [driver, setDriver] = useState<DriverId>("albon")
-  const [activeTab, setActiveTab] = useState<TabId>("tension")
+  const [activeTab, setActiveTab] = useState<TabId>("telemetry")
   const [sessionLabel, setSessionLabel] = useState("Session")
   const [liveData, setLiveData] = useState<LiveData>(LIVE_DATA_DEFAULTS)
 
   const driverName = driver === "albon" ? "Albon" : "Sainz"
   const driverNum = driver === "albon" ? "23" : "55"
+
+  usePurpleSectorToasts()
 
   useEffect(() => {
     cachedFetch<any[]>(getSessionsUrl())
@@ -1069,8 +1099,9 @@ export function HomeDashboard({ onBack }: HomeDashboardProps) {
       const tenSecAgo = new Date(rounded.getTime() - 10_000).toISOString()
 
       try {
-        // Always fetch laps (needed for currentLap across all tabs)
-        const lapsP = cachedFetch<any[]>(`https://api.openf1.org/v1/laps?session_key=${sk}&driver_number=${driverNum}`).catch(() => [])
+        // Always fetch laps + position (needed across all tabs for header)
+        const lapsP = cachedFetch<any[]>(`https://api.openf1.org/v1/laps?session_key=${sk}&driver_number=${driverNum}&date_start%3C=${encodeURIComponent(simIso)}`).catch(() => [])
+        const positionP = cachedFetch<any[]>(`https://api.openf1.org/v1/position?session_key=${sk}&driver_number=${driverNum}&date%3C=${encodeURIComponent(simIso)}`).catch(() => [])
 
         // Only fetch what the active tab needs
         const intervalsP = activeTab === "tension"
@@ -1089,7 +1120,7 @@ export function HomeDashboard({ onBack }: HomeDashboardProps) {
           ? cachedFetch<any[]>(`https://api.openf1.org/v1/location?session_key=${sk}&driver_number=${driverNum}&date%3C=${encodeURIComponent(simIso)}&date%3E=${encodeURIComponent(tenSecAgo)}`).catch(() => [])
           : Promise.resolve(null)
 
-        const [laps, intervals, stints, carData, location] = await Promise.all([lapsP, intervalsP, stintsP, carDataP, locationP])
+        const [laps, positionsArr, intervals, stints, carData, location] = await Promise.all([lapsP, positionP, intervalsP, stintsP, carDataP, locationP])
 
         if (stale) return
 
@@ -1102,11 +1133,16 @@ export function HomeDashboard({ onBack }: HomeDashboardProps) {
           else break
         }
 
+        // Derive position from latest entry
+        const posArr = Array.isArray(positionsArr) ? positionsArr : []
+        const latestPos = posArr.length > 0 ? posArr[posArr.length - 1].position ?? null : null
+
         setLiveData((prev) => {
           const next = {
             ...prev,
             laps: Array.isArray(laps) ? laps.map((l: any) => ({ lap_number: l.lap_number, date_start: l.date_start })) : prev.laps,
             currentLap,
+            position: latestPos ?? prev.position,
           }
 
           if (intervals != null) next.intervals = Array.isArray(intervals) ? intervals : []
@@ -1154,8 +1190,8 @@ export function HomeDashboard({ onBack }: HomeDashboardProps) {
   }, [driver])
 
   const tabs: { id: TabId; label: string; icon: typeof TrendingUp }[] = [
-    { id: "tension", label: "Tension", icon: TrendingUp },
     { id: "telemetry", label: "Telemetry", icon: Activity },
+    { id: "tension", label: "Tension", icon: TrendingUp },
     { id: "tyre", label: "Tyres", icon: CircleDot },
   ]
 
@@ -1164,7 +1200,7 @@ export function HomeDashboard({ onBack }: HomeDashboardProps) {
   return (
     <div className="h-full min-h-dvh flex flex-col bg-background">
       {/* Header */}
-      <header className="sticky top-0 z-20 bg-background/80 backdrop-blur-xl border-b border-border">
+      <header className="sticky top-0 z-20 bg-background border-b border-border">
         <div className="flex items-center gap-3 px-5 pt-12 pb-3">
           <button
             onClick={onBack}
@@ -1174,14 +1210,26 @@ export function HomeDashboard({ onBack }: HomeDashboardProps) {
             <ArrowLeft className="w-5 h-5 text-muted-foreground" />
           </button>
           <Image src="/Williams_F1_logo_2026.png" alt="Williams Racing" width={112} height={40} className="w-28 h-auto" />
-          <div className="ml-auto flex items-center gap-3">
-            <span className="px-2.5 py-0.5 rounded-full bg-[#2563EB]/10 text-[#2563EB] text-[10px] font-mono uppercase tracking-wider border border-[#2563EB]/20">
-              {sessionLabel}
-            </span>
-            <span className="flex items-center gap-1.5">
-              <span className="w-2 h-2 rounded-full bg-[#2563EB] animate-pulse" />
-              <span className="text-[11px] text-[#2563EB] font-mono uppercase">At Home</span>
-            </span>
+          <div className="ml-auto flex flex-col items-end gap-1.5">
+            <div className="flex items-center gap-2">
+              <span className="px-2 py-0.5 rounded-full bg-[#7C3AED]/10 text-[#7C3AED] text-[10px] font-mono font-bold uppercase tracking-wider border border-[#7C3AED]/20">
+                LAP {liveData.currentLap}
+              </span>
+              <span className="px-2.5 py-0.5 rounded-full bg-[#2563EB]/10 text-[#2563EB] text-[10px] font-mono uppercase tracking-wider border border-[#2563EB]/20">
+                {sessionLabel}
+              </span>
+            </div>
+            <div className="flex items-center gap-2">
+              {liveData.position != null && (
+                <span className="px-2.5 py-0.5 rounded-full bg-emerald-400/10 text-emerald-400 text-[10px] font-mono font-bold uppercase tracking-wider border border-emerald-400/20">
+                  POSITION {liveData.position}
+                </span>
+              )}
+              <span className="flex items-center gap-1.5">
+                <span className="w-2 h-2 rounded-full bg-[#2563EB] animate-pulse" />
+                <span className="text-[11px] text-[#2563EB] font-mono uppercase">At Home</span>
+              </span>
+            </div>
           </div>
         </div>
         <div className="px-5 pb-3">
