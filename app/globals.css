@@ -181,3 +181,21 @@
   0%, 100% { opacity: 1; }
   50% { opacity: 0; }
 }
+
+/* Team Radio audio bars */
+@keyframes audioBar1 {
+  0%, 100% { height: 4px; }
+  50% { height: 16px; }
+}
+@keyframes audioBar2 {
+  0%, 100% { height: 12px; }
+  50% { height: 4px; }
+}
+@keyframes audioBar3 {
+  0%, 100% { height: 6px; }
+  50% { height: 14px; }
+}
+@keyframes audioBar4 {
+  0%, 100% { height: 10px; }
+  50% { height: 6px; }
+}

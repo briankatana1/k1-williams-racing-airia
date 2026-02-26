@@ -1,11 +1,14 @@
 "use client"
 
 import { useState, useEffect, useRef } from "react"
-import { ArrowLeft, Zap, MessageCircle, Send, Mic, CloudRain } from "lucide-react"
+import { ArrowLeft, Zap, Radio, CloudRain, MapPin } from "lucide-react"
 import Image from "next/image"
 import { DriverSelector, type DriverId } from "./driver-selector"
 import { fetchPitData, type PitData } from "@/lib/openf1"
 import { getMeetingKey, getSessionKey, getStartLap, getSessionsUrl, cachedFetch, sessionTypeToLabel } from "@/lib/simulation"
+import { TeamRadioCard } from "./team-radio"
+import { LivePositionCard } from "./live-position"
+import { AskAiFab } from "./ask-ai"
 
 interface VenueDashboardProps {
   onBack: () => void
@@ -303,163 +306,6 @@ function DataCell({ label, value, highlight = false }: { label: string; value: s
 }
 
 
-// --- Voice Assistant ---
-
-interface Message {
-  id: number
-  role: "user" | "assistant"
-  content: string
-}
-
-async function askAiria(userInput: string): Promise<string> {
-  const meetingKey = getMeetingKey()
-  const sessionKey = getSessionKey()
-  const currentLap = getStartLap(30)
-  const simTime = process.env.NEXT_PUBLIC_SIM_TIME ?? new Date().toISOString()
-
-  const context = `[Context: Meeting key: ${meetingKey}, Session key: ${sessionKey}, current lap: ${currentLap}, current time: ${simTime}]\n\n${userInput}`
-
-  try {
-    const res = await fetch("/api/airia", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ userInput: context, pipeline: "chat" }),
-    })
-    const data = await res.json()
-    if (data.error) return "Sorry, I could not get a response right now."
-    return data.result ?? data.output ?? data.response ?? "No response received."
-  } catch {
-    return "Sorry, something went wrong. Please try again."
-  }
-}
-
-function VoiceAssistant() {
-  const [messages, setMessages] = useState<Message[]>([
-    {
-      id: 0,
-      role: "assistant",
-      content: "Hey! I am your Williams AI companion. Ask me anything about what is happening in the race — safety cars, penalties, strategy calls, or anything you are curious about.",
-    },
-  ])
-  const [input, setInput] = useState("")
-  const [isTyping, setIsTyping] = useState(false)
-  const scrollRef = useRef<HTMLDivElement>(null)
-
-  useEffect(() => {
-    if (scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight
-    }
-  }, [messages, isTyping])
-
-  const sendMessage = async (text: string) => {
-    if (!text.trim() || isTyping) return
-
-    const userMsg: Message = { id: Date.now(), role: "user", content: text.trim() }
-    setMessages((prev) => [...prev, userMsg])
-    setInput("")
-    setIsTyping(true)
-
-    const response = await askAiria(text.trim())
-
-    setMessages((prev) => [
-      ...prev,
-      { id: Date.now() + 1, role: "assistant", content: response },
-    ])
-    setIsTyping(false)
-  }
-
-  return (
-    <div className="rounded-2xl border border-border bg-card overflow-hidden flex flex-col flex-1 min-h-0">
-      {/* Header */}
-      <div className="flex items-center justify-between px-5 py-4 border-b border-border flex-shrink-0">
-        <div className="flex items-center gap-3">
-          <div className="w-10 h-10 rounded-lg bg-[#2563EB]/10 flex items-center justify-center border border-[#2563EB]/20">
-            <MessageCircle className="w-5 h-5 text-[#2563EB]" />
-          </div>
-          <div>
-            <h3 className="font-semibold text-foreground text-sm">{"What Just Happened?"}</h3>
-            <p className="text-xs text-muted-foreground">AI Assistant</p>
-          </div>
-        </div>
-      </div>
-
-      {/* Messages */}
-      <div ref={scrollRef} className="flex-1 overflow-y-auto scrollbar-hide px-4 py-4 flex flex-col gap-3" style={{ scrollbarWidth: "none", WebkitOverflowScrolling: "touch" }}>
-        {messages.map((msg) => (
-          <div
-            key={msg.id}
-            className={`max-w-[85%] px-4 py-3 rounded-2xl text-sm leading-relaxed ${
-              msg.role === "user"
-                ? "ml-auto bg-[#2563EB] text-[#FFFFFF] rounded-br-md"
-                : "mr-auto bg-secondary text-foreground rounded-bl-md"
-            }`}
-          >
-            {msg.content}
-          </div>
-        ))}
-        {isTyping && (
-          <div className="mr-auto bg-secondary text-foreground rounded-2xl rounded-bl-md px-4 py-3">
-            <div className="flex items-center gap-1.5">
-              <span className="w-2 h-2 rounded-full bg-[#2563EB] animate-bounce" style={{ animationDelay: "0ms" }} />
-              <span className="w-2 h-2 rounded-full bg-[#2563EB] animate-bounce" style={{ animationDelay: "150ms" }} />
-              <span className="w-2 h-2 rounded-full bg-[#2563EB] animate-bounce" style={{ animationDelay: "300ms" }} />
-            </div>
-          </div>
-        )}
-      </div>
-
-      {/* Quick questions */}
-      <div className="px-4 pb-2 flex gap-2 flex-wrap flex-shrink-0">
-        {["Safety car?", "Tyre update?", "Weather?"].map((q) => (
-          <button
-            key={q}
-            onClick={() => sendMessage(q)}
-            disabled={isTyping}
-            className="px-3 py-1.5 rounded-full bg-secondary/80 border border-border text-xs text-muted-foreground hover:text-foreground hover:border-[#2563EB]/30 transition-colors disabled:opacity-40"
-          >
-            {q}
-          </button>
-        ))}
-      </div>
-
-      {/* Input */}
-      <div className="px-4 pb-4 pt-2 border-t border-border flex-shrink-0">
-        <form
-          onSubmit={(e) => {
-            e.preventDefault()
-            sendMessage(input)
-          }}
-          className="flex items-center gap-2"
-        >
-          <button
-            type="button"
-            className="p-2.5 rounded-xl bg-secondary border border-border hover:border-[#2563EB]/30 transition-colors"
-            aria-label="Voice input"
-          >
-            <Mic className="w-4 h-4 text-muted-foreground" />
-          </button>
-          <input
-            type="text"
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            placeholder="Ask about the race..."
-            className="flex-1 bg-secondary border border-border rounded-xl px-4 py-2.5 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:border-[#2563EB]/50 transition-colors"
-          />
-          <button
-            type="submit"
-            disabled={!input.trim() || isTyping}
-            className="p-2.5 rounded-xl bg-[#2563EB] text-[#FFFFFF] disabled:opacity-40 hover:bg-[#2563EB]/90 transition-colors"
-            aria-label="Send message"
-          >
-            <Send className="w-4 h-4" />
-          </button>
-        </form>
-      </div>
-    </div>
-  )
-}
-
-
 // --- Main Dashboard ---
 
 function useSessionLabel(): string {
@@ -474,7 +320,7 @@ function useSessionLabel(): string {
 
 export function VenueDashboard({ onBack }: VenueDashboardProps) {
   const [driver, setDriver] = useState<DriverId>("albon")
-  const [activeTab, setActiveTab] = useState<"pit" | "voice">("pit")
+  const [activeTab, setActiveTab] = useState<"pit" | "radio" | "track">("pit")
   const sessionLabel = useSessionLabel()
 
   return (
@@ -507,40 +353,35 @@ export function VenueDashboard({ onBack }: VenueDashboardProps) {
 
       {/* Tab switcher */}
       <div className="px-5 pt-4">
-        <div className="flex gap-2 p-1 rounded-xl bg-secondary/60 border border-border">
-          <button
-            onClick={() => setActiveTab("pit")}
-            className={`flex-1 flex items-center justify-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all ${
-              activeTab === "pit"
-                ? "bg-card text-foreground border border-border shadow-sm"
-                : "text-muted-foreground hover:text-foreground"
-            }`}
-          >
-            <Zap className="w-4 h-4" />
-            <span>Pit Strategy</span>
-          </button>
-          <button
-            onClick={() => setActiveTab("voice")}
-            className={`flex-1 flex items-center justify-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all ${
-              activeTab === "voice"
-                ? "bg-card text-foreground border border-border shadow-sm"
-                : "text-muted-foreground hover:text-foreground"
-            }`}
-          >
-            <MessageCircle className="w-4 h-4" />
-            <span>Ask AI</span>
-          </button>
+        <div className="flex gap-1 p-1 rounded-xl bg-secondary/60 border border-border">
+          {([
+            { id: "pit" as const, label: "Pit Strategy", Icon: Zap },
+            { id: "radio" as const, label: "Team Radio", Icon: Radio },
+            { id: "track" as const, label: "Track", Icon: MapPin },
+          ]).map(({ id, label, Icon }) => (
+            <button
+              key={id}
+              onClick={() => setActiveTab(id)}
+              className={`flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg text-xs font-medium transition-all ${
+                activeTab === id
+                  ? "bg-card text-foreground border border-border shadow-sm"
+                  : "text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              <Icon className="w-3.5 h-3.5" />
+              <span>{label}</span>
+            </button>
+          ))}
         </div>
       </div>
 
       {/* Content */}
       <main className="flex-1 min-h-0 px-5 py-4 flex flex-col">
-        {activeTab === "pit" ? (
-          <PitStrategyCard driver={driver} />
-        ) : (
-          <VoiceAssistant />
-        )}
+        {activeTab === "pit" && <PitStrategyCard driver={driver} />}
+        {activeTab === "radio" && <TeamRadioCard driver={driver} />}
+        {activeTab === "track" && <LivePositionCard driver={driver} />}
       </main>
+      <AskAiFab />
     </div>
   )
 }

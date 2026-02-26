@@ -5,6 +5,8 @@ import { ArrowLeft, TrendingUp, Activity, CircleDot, ChevronDown, ChevronUp, Loa
 import Image from "next/image"
 import { DriverSelector, type DriverId } from "./driver-selector"
 import { getStartLap, getSessionKey, getSessionsUrl, cachedFetch, sessionTypeToLabel, now as simNow } from "@/lib/simulation"
+import { AskAiFab } from "./ask-ai"
+import { fetchCircuitLayout, findNearestCorner, MiniTrackMap, type CircuitLayout, type DriverPosition } from "./track-map"
 
 // Typewriter hook — reveals text word-by-word
 function useTypewriter(text: string, speed = 30): string {
@@ -558,25 +560,6 @@ interface CarDataReading {
   drs: number
 }
 
-interface CircuitCorner {
-  number: number
-  trackPosition: { x: number; y: number }
-  angle: number
-  length: number
-}
-
-interface CircuitLayout {
-  x: number[]
-  y: number[]
-  corners: CircuitCorner[]
-  rotation: number
-}
-
-interface DriverPosition {
-  x: number
-  y: number
-}
-
 interface TelemetryState {
   reading: CarDataReading | null
   gForce: number | null
@@ -586,159 +569,6 @@ interface TelemetryState {
   activeCorner: number | null
   loading: boolean
   error: string | null
-}
-
-let _circuitLayoutCache: Promise<CircuitLayout | null> | null = null
-
-function fetchCircuitLayout(): Promise<CircuitLayout | null> {
-  if (!_circuitLayoutCache) {
-    _circuitLayoutCache = fetch("/api/circuit")
-      .then((r) => {
-        if (!r.ok) throw new Error(`Circuit API ${r.status}`)
-        return r.json()
-      })
-      .catch((err) => {
-        _circuitLayoutCache = null
-        console.warn("Failed to load circuit layout:", err)
-        return null
-      })
-  }
-  return _circuitLayoutCache
-}
-
-function findNearestCorner(pos: DriverPosition, corners: CircuitCorner[]): number | null {
-  if (!corners.length) return null
-  let best = corners[0]
-  let bestDist = Infinity
-  for (const c of corners) {
-    const dx = pos.x - c.trackPosition.x
-    const dy = pos.y - c.trackPosition.y
-    const d = dx * dx + dy * dy
-    if (d < bestDist) { bestDist = d; best = c }
-  }
-  // Only highlight if driver is within ~200m of the corner (squared distance threshold)
-  if (bestDist > 200 * 200) return null
-  return best.number
-}
-
-function MiniTrackMap({ layout, activeCorner, driverPos }: { layout: CircuitLayout | null; activeCorner: number | null; driverPos: DriverPosition | null }) {
-  if (!layout || !layout.x || layout.x.length === 0) return null
-
-  // Downsample to ~200 points for performance
-  const step = Math.max(1, Math.floor(layout.x.length / 200))
-  const points: { x: number; y: number }[] = []
-  for (let i = 0; i < layout.x.length; i += step) {
-    points.push({ x: layout.x[i], y: layout.y[i] })
-  }
-
-  // Use full (non-downsampled) bounds so corners align
-  const minX = Math.min(...layout.x)
-  const maxX = Math.max(...layout.x)
-  const minY = Math.min(...layout.y)
-  const maxY = Math.max(...layout.y)
-  const padding = 200
-  const rawW = maxX - minX + padding * 2
-  const rawH = maxY - minY + padding * 2
-
-  const pathD = points
-    .map((p, i) => `${i === 0 ? "M" : "L"}${p.x - minX + padding},${p.y - minY + padding}`)
-    .join(" ") + " Z"
-
-  // Apply rotation inside SVG and compute tight bounding box of rotated content
-  const rotation = layout.rotation ?? 280
-  const rad = (rotation * Math.PI) / 180
-  const cosR = Math.cos(rad)
-  const sinR = Math.sin(rad)
-  const centerX = rawW / 2
-  const centerY = rawH / 2
-
-  // Rotate all outline points + corner positions to find the tight rotated bounding box
-  const allPts: { x: number; y: number }[] = [
-    ...points.map((p) => ({ x: p.x - minX + padding, y: p.y - minY + padding })),
-    ...(layout.corners ?? []).map((c) => ({ x: c.trackPosition.x - minX + padding, y: c.trackPosition.y - minY + padding })),
-  ]
-  let rMinX = Infinity, rMaxX = -Infinity, rMinY = Infinity, rMaxY = -Infinity
-  for (const p of allPts) {
-    const dx = p.x - centerX, dy = p.y - centerY
-    const rx = dx * cosR - dy * sinR + centerX
-    const ry = dx * sinR + dy * cosR + centerY
-    if (rx < rMinX) rMinX = rx
-    if (rx > rMaxX) rMaxX = rx
-    if (ry < rMinY) rMinY = ry
-    if (ry > rMaxY) rMaxY = ry
-  }
-  const rotPad = 150
-  const vbX = rMinX - rotPad
-  const vbY = rMinY - rotPad
-  const vbW = rMaxX - rMinX + rotPad * 2
-  const vbH = rMaxY - rMinY + rotPad * 2
-
-  // Scale factors for corner dots / text relative to viewbox size
-  const refSize = Math.max(vbW, vbH)
-  const dotR = refSize / 80
-  const fontSize = refSize / 60
-
-  return (
-    <div className="rounded-xl bg-secondary/40 border border-border p-3 mb-4">
-      <span className="text-[10px] text-muted-foreground uppercase tracking-wider mb-2 block">Track Map</span>
-      <svg
-        viewBox={`${vbX} ${vbY} ${vbW} ${vbH}`}
-        className="w-full"
-        style={{ maxHeight: "22rem" }}
-        preserveAspectRatio="xMidYMid meet"
-      >
-        <g transform={`rotate(${rotation},${centerX},${centerY})`}>
-          {/* Track outline */}
-          <path d={pathD} fill="none" stroke="currentColor" strokeWidth={Math.max(8, refSize / 200)} className="text-border" strokeLinecap="round" strokeLinejoin="round" />
-          <path d={pathD} fill="none" stroke="currentColor" strokeWidth={Math.max(3, refSize / 500)} className="text-muted-foreground/40" strokeLinecap="round" strokeLinejoin="round" />
-
-          {/* Corner markers */}
-          {(layout.corners ?? []).map((c) => {
-            const cx = c.trackPosition.x - minX + padding
-            const cy = c.trackPosition.y - minY + padding
-            const isActive = activeCorner === c.number
-            return (
-              <g key={c.number}>
-                {isActive && (
-                  <>
-                    <circle cx={cx} cy={cy} r={dotR * 3} fill="#EF4444" opacity={0.3} className="animate-ping" />
-                    <circle cx={cx} cy={cy} r={dotR * 1.6} fill="#EF4444" className="animate-pulse" />
-                  </>
-                )}
-                <circle cx={cx} cy={cy} r={isActive ? dotR * 1.4 : dotR} fill={isActive ? "#EF4444" : "#2563EB"} opacity={isActive ? 1 : 0.6} />
-                <text
-                  x={cx}
-                  y={cy}
-                  textAnchor="middle"
-                  dominantBaseline="central"
-                  fill="white"
-                  fontSize={isActive ? fontSize * 1.1 : fontSize}
-                  fontWeight="bold"
-                  fontFamily="monospace"
-                  transform={`rotate(${-rotation},${cx},${cy})`}
-                >
-                  {c.number}
-                </text>
-              </g>
-            )
-          })}
-
-          {/* Driver position */}
-          {driverPos && (() => {
-            const dx = driverPos.x - minX + padding
-            const dy = driverPos.y - minY + padding
-            return (
-              <g>
-                <circle cx={dx} cy={dy} r={dotR * 4} fill="#EF4444" opacity={0.2} className="animate-ping" />
-                <circle cx={dx} cy={dy} r={dotR * 2} fill="#EF4444" className="animate-pulse" />
-                <circle cx={dx} cy={dy} r={dotR * 1.5} fill="#EF4444" stroke="white" strokeWidth={dotR * 0.4} />
-              </g>
-            )
-          })()}
-        </g>
-      </svg>
-    </div>
-  )
 }
 
 function TelemetryStoryteller({ driver, driverName, driverNum, liveData }: LiveDataProps) {
@@ -793,12 +623,21 @@ function TelemetryStoryteller({ driver, driverName, driverNum, liveData }: LiveD
         n_gear: latest.n_gear ?? 0,
         drs: latest.drs ?? 0,
       }
-      if (carData.length >= 2) {
-        const prev = carData[carData.length - 2]
-        const dtMs = new Date(latest.date).getTime() - new Date(prev.date).getTime()
-        if (dtMs > 0) {
-          const dvMs2 = ((latest.speed ?? 0) - (prev.speed ?? 0)) / 3.6
-          gForce = Math.round(Math.abs(dvMs2 / (dtMs / 1000) / 9.81) * 10) / 10
+      // Average g-force over last several samples to reduce noise
+      if (carData.length >= 3) {
+        const samples = carData.slice(-Math.min(carData.length, 8))
+        let totalG = 0
+        let count = 0
+        for (let i = 1; i < samples.length; i++) {
+          const dtMs = new Date(samples[i].date).getTime() - new Date(samples[i - 1].date).getTime()
+          if (dtMs > 0 && dtMs < 2000) {
+            const dvMs = ((samples[i].speed ?? 0) - (samples[i - 1].speed ?? 0)) / 3.6
+            totalG += Math.abs(dvMs / (dtMs / 1000) / 9.81)
+            count++
+          }
+        }
+        if (count > 0) {
+          gForce = Math.round((totalG / count) * 10) / 10
         }
       }
     }
@@ -811,7 +650,7 @@ function TelemetryStoryteller({ driver, driverName, driverNum, liveData }: LiveD
 
     if (reading) {
       const activeCorner = driverPos && circuit ? findNearestCorner(driverPos, circuit.corners ?? []) : null
-      setState((prev) => ({ ...prev, reading, gForce, driverPos, activeCorner: activeCorner ?? prev.activeCorner }))
+      setState((prev) => ({ ...prev, reading, gForce, driverPos, activeCorner }))
     }
   }, [liveData.carData, liveData.location, circuit])
 
@@ -1028,21 +867,15 @@ function TyrePredictor({ driver, driverName, driverNum, liveData }: LiveDataProp
   const currentLap = liveData.currentLap
   const totalLaps = 58
 
-  const classifiedStints = liveData.stints.map((s) => {
-    const isActive = s.lap_end >= currentLap || s.lap_end === 0 || s.stint_number === liveData.stints.length
-    const status: "active" | "completed" = (isActive && s.lap_start <= currentLap) ? "active" : "completed"
-    const tyreAge = status === "active" ? currentLap - s.lap_start + s.tyre_age_at_start : undefined
+  // Filter to only stints that have started within the sim time — drop future stints
+  const startedStints = liveData.stints.filter((s) => s.lap_start <= currentLap)
+
+  const classifiedStints = startedStints.map((s, i) => {
+    const isActive = i === startedStints.length - 1 // last started stint is the current one
+    const status: "active" | "completed" = isActive ? "active" : "completed"
+    const tyreAge = isActive ? currentLap - s.lap_start + s.tyre_age_at_start : undefined
     return { ...s, status, tyreAge }
   })
-
-  // If the last stint extends beyond currentLap, mark it active
-  if (classifiedStints.length > 0) {
-    const last = classifiedStints[classifiedStints.length - 1]
-    if (last.status === "completed" && last.lap_end >= currentLap) {
-      last.status = "active"
-      last.tyreAge = currentLap - last.lap_start + last.tyre_age_at_start
-    }
-  }
 
   // Predict button — same pattern as telemetry Analyze
   const predictRef = useRef<() => void>(() => {})
@@ -1217,37 +1050,50 @@ export function HomeDashboard({ onBack }: HomeDashboardProps) {
       .catch(() => {})
   }, [])
 
-  // Centralised live data polling — one 60s loop for all OpenF1 endpoints
+  // Tab-aware live data polling — only fetch endpoints the active tab needs
   useEffect(() => {
     let stale = false
-    let firstFetch = true
 
     async function poll() {
       if (document.hidden) return
-      if (!firstFetch) {
-        const sinceLast = Date.now() - _lastLiveDataFetchTime
-        if (_lastLiveDataFetchTime > 0 && sinceLast < 60_000) return
-      }
-      firstFetch = false
+      // Debounce: skip if polled <200ms ago (blocks strict-mode double-mount, not tab switches)
+      const sinceLast = Date.now() - _lastLiveDataFetchTime
+      if (_lastLiveDataFetchTime > 0 && sinceLast < 200) return
       _lastLiveDataFetchTime = Date.now()
 
       const sk = getSessionKey()
       const simTime = simNow()
-      const simIso = simTime.toISOString()
-      const tenSecAgo = new Date(simTime.getTime() - 10_000).toISOString()
+      // Round to nearest 5s so each poll gets a fresh cache key without hammering OpenF1
+      const rounded = new Date(Math.floor(simTime.getTime() / 5_000) * 5_000)
+      const simIso = rounded.toISOString()
+      const tenSecAgo = new Date(rounded.getTime() - 10_000).toISOString()
 
       try {
-        const [laps, intervals, stints, carData, location] = await Promise.all([
-          cachedFetch<any[]>(`https://api.openf1.org/v1/laps?session_key=${sk}&driver_number=${driverNum}`).catch(() => []),
-          cachedFetch<any[]>(`https://api.openf1.org/v1/intervals?session_key=${sk}&driver_number=${driverNum}&date%3C=${encodeURIComponent(simIso)}`).catch(() => []),
-          cachedFetch<any[]>(`https://api.openf1.org/v1/stints?session_key=${sk}&driver_number=${driverNum}`).catch(() => []),
-          cachedFetch<any[]>(`https://api.openf1.org/v1/car_data?session_key=${sk}&driver_number=${driverNum}&date%3C=${encodeURIComponent(simIso)}&date%3E=${encodeURIComponent(tenSecAgo)}`).catch(() => []),
-          cachedFetch<any[]>(`https://api.openf1.org/v1/location?session_key=${sk}&driver_number=${driverNum}&date%3C=${encodeURIComponent(simIso)}&date%3E=${encodeURIComponent(tenSecAgo)}`).catch(() => []),
-        ])
+        // Always fetch laps (needed for currentLap across all tabs)
+        const lapsP = cachedFetch<any[]>(`https://api.openf1.org/v1/laps?session_key=${sk}&driver_number=${driverNum}`).catch(() => [])
+
+        // Only fetch what the active tab needs
+        const intervalsP = activeTab === "tension"
+          ? cachedFetch<any[]>(`https://api.openf1.org/v1/intervals?session_key=${sk}&driver_number=${driverNum}&date%3C=${encodeURIComponent(simIso)}`).catch(() => [])
+          : Promise.resolve(null)
+
+        const stintsP = activeTab === "tyre"
+          ? cachedFetch<any[]>(`https://api.openf1.org/v1/stints?session_key=${sk}&driver_number=${driverNum}`).catch(() => [])
+          : Promise.resolve(null)
+
+        const carDataP = activeTab === "telemetry"
+          ? cachedFetch<any[]>(`https://api.openf1.org/v1/car_data?session_key=${sk}&driver_number=${driverNum}&date%3C=${encodeURIComponent(simIso)}&date%3E=${encodeURIComponent(tenSecAgo)}`).catch(() => [])
+          : Promise.resolve(null)
+
+        const locationP = activeTab === "telemetry"
+          ? cachedFetch<any[]>(`https://api.openf1.org/v1/location?session_key=${sk}&driver_number=${driverNum}&date%3C=${encodeURIComponent(simIso)}&date%3E=${encodeURIComponent(tenSecAgo)}`).catch(() => [])
+          : Promise.resolve(null)
+
+        const [laps, intervals, stints, carData, location] = await Promise.all([lapsP, intervalsP, stintsP, carDataP, locationP])
 
         if (stale) return
 
-        // Derive currentLap from laps + simNow (dynamic approach)
+        // Derive currentLap from laps
         const t = simTime.getTime()
         let currentLap = getStartLap(30)
         const lapArr = Array.isArray(laps) ? laps : []
@@ -1256,24 +1102,29 @@ export function HomeDashboard({ onBack }: HomeDashboardProps) {
           else break
         }
 
-        // Normalise stints
-        const normStints: TyreStint[] = Array.isArray(stints)
-          ? stints.map((s: any) => ({
-              stint_number: s.stint_number,
-              lap_start: s.lap_start,
-              lap_end: s.lap_end,
-              compound: (s.compound ?? "UNKNOWN").toUpperCase(),
-              tyre_age_at_start: s.tyre_age_at_start ?? 0,
-            }))
-          : []
+        setLiveData((prev) => {
+          const next = {
+            ...prev,
+            laps: Array.isArray(laps) ? laps.map((l: any) => ({ lap_number: l.lap_number, date_start: l.date_start })) : prev.laps,
+            currentLap,
+          }
 
-        setLiveData({
-          laps: Array.isArray(laps) ? laps.map((l: any) => ({ lap_number: l.lap_number, date_start: l.date_start })) : [],
-          intervals: Array.isArray(intervals) ? intervals : [],
-          stints: normStints,
-          carData: Array.isArray(carData) ? carData : [],
-          location: Array.isArray(location) ? location : [],
-          currentLap,
+          if (intervals != null) next.intervals = Array.isArray(intervals) ? intervals : []
+          if (stints != null) {
+            next.stints = Array.isArray(stints)
+              ? stints.map((s: any) => ({
+                  stint_number: s.stint_number,
+                  lap_start: s.lap_start,
+                  lap_end: s.lap_end,
+                  compound: (s.compound ?? "UNKNOWN").toUpperCase(),
+                  tyre_age_at_start: s.tyre_age_at_start ?? 0,
+                }))
+              : []
+          }
+          if (carData != null) next.carData = Array.isArray(carData) ? carData : []
+          if (location != null) next.location = Array.isArray(location) ? location : []
+
+          return next
         })
       } catch {
         // Non-critical — keep existing data
@@ -1281,7 +1132,8 @@ export function HomeDashboard({ onBack }: HomeDashboardProps) {
     }
 
     poll()
-    const timer = setInterval(poll, 60_000)
+    const pollInterval = activeTab === "telemetry" ? 5_000 : 60_000
+    const timer = setInterval(poll, pollInterval)
 
     function onVisChange() {
       if (!document.hidden && !stale) poll()
@@ -1293,7 +1145,7 @@ export function HomeDashboard({ onBack }: HomeDashboardProps) {
       clearInterval(timer)
       document.removeEventListener("visibilitychange", onVisChange)
     }
-  }, [driver, driverNum])
+  }, [driver, driverNum, activeTab])
 
   // Reset live data + cooldown when driver changes
   useEffect(() => {
@@ -1365,6 +1217,7 @@ export function HomeDashboard({ onBack }: HomeDashboardProps) {
         <div className={activeTab === "telemetry" ? "" : "hidden"}><TelemetryStoryteller {...liveDataProps} /></div>
         <div className={activeTab === "tyre" ? "" : "hidden"}><TyrePredictor {...liveDataProps} /></div>
       </main>
+      <AskAiFab />
     </div>
   )
 }

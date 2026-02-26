@@ -182,11 +182,11 @@ export function WatchingSelect({ onSelect, onBack }: WatchingSelectProps) {
                   </span>
                   <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-white/[0.06] border border-white/[0.08] text-xs text-muted-foreground font-mono">
                     <Zap className="w-3 h-3 text-emerald-400" />
-                    Voice Assistant
+                    Team Voice
                   </span>
                   <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-white/[0.06] border border-white/[0.08] text-xs text-muted-foreground font-mono">
                     <Zap className="w-3 h-3 text-emerald-400" />
-                    Live Questions
+                    Driver Tracker
                   </span>
                 </div>
 
